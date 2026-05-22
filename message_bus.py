@@ -4,10 +4,10 @@ import asyncio
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Callable, Coroutine, Dict, List, Optional
 
-logger = logging.getLogger("arcane.bus")
+logger = logging.getLogger("mycel.bus")
 
 Callback = Callable[["Message"], Coroutine[Any, Any, None]]
 
@@ -30,7 +30,7 @@ class Message:
         self.forge_name = forge_name
         self.skill_name = skill_name
         self.data = data or {}
-        self.timestamp = datetime.utcnow().isoformat()
+        self.timestamp = datetime.now(timezone.utc).isoformat()
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -60,7 +60,7 @@ class MessageBus:
 
     async def publish(self, message: Message) -> None:
         if self._queue is None:
-            logger.warning("MessageBus pas encore demarre, message ignore: %s", message.content[:80])
+            logger.warning("MessageBus not started, message dropped: %s", message.content[:80])
             return
         await self._queue.put(message)
 
@@ -68,7 +68,7 @@ class MessageBus:
         self._queue = asyncio.Queue()
         self._running = True
         self._task = asyncio.create_task(self._process_loop())
-        logger.info("MessageBus demarre")
+        logger.info("MessageBus started")
 
     async def stop(self) -> None:
         self._running = False
@@ -79,7 +79,7 @@ class MessageBus:
             except asyncio.CancelledError:
                 pass
             self._task = None
-        logger.info("MessageBus arrêté")
+        logger.info("MessageBus stopped")
 
     async def _process_loop(self) -> None:
         while self._running:

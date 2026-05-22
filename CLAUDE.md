@@ -1,90 +1,88 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code when working with code in this repository.
+This file guides Claude Code when working with code in this repository.
 
 ## Project
 
-Arcane is a Discord-driven multi-agent orchestrator for AI-Driven Development. Users invoke **Circles** (execution environments) via Discord commands, which run **Spells** (plan, elaborate, arch-review, implement, tech-review, etc.) by calling **Familiars** (Claude Code, Gemini, Cursor Agent) as subprocesses.
+**Mycel** is a Discord-driven multi-agent orchestrator for AI-Driven Development. Users invoke **rituals** on **forges** (YAML `forges:`) via Discord commands, which run **spells** (plan, elaborate, arch-review, implement, tech-review, etc.) by calling **familiars** (Claude Code, Gemini, Cursor Agent) as subprocesses.
+
+The metaphor: the **Mycel** network connects **Forges**; each Forge runs a **Ritual** (a sequence of spells); each spell is cast by a **Familiar**.
 
 ## Commands
 
 ```bash
-python discord_bot.py                      # Run
-python3 -m pytest tests/ -v               # Tests (93)
-python3 -m py_compile arcane.py forge.py runner.py discord_bot.py  # Syntax check
+python discord_bot.py  # Run
+python3 -m pytest tests/ -v  # Tests
+python3 -m py_compile mycel.py forge.py runner.py discord_bot.py  # Syntax check
 ```
 
 ## Architecture
 
 ```
-discord_bot.py  ->  arcane.py  ->  forge.py  ->  runner.py
-                       |                |
-                       +----------------+-->  message_bus.py
+discord_bot.py -> mycel.py -> forge.py -> runner.py
+  |  |
+  +----------------+--> message_bus.py
 ```
 
-- **Arcane** (`arcane.py`): grimoire central — config, circles, per-circle task queues, auto-resume, hot-reload, forge chains
-- **Circle** (`forge.py`): state machine — rituals (workflows), parallel spells (`asyncio.gather`), pre/post_run hooks, git prepare/finalize, output validation, caching, metrics, reviewer echo (inter-agent feedback)
-- **Familiars** (`runner.py`): ClaudeRunner, GeminiRunner, CursorRunner with fallbacks. Token tracking. `cwd` set to workspace repo.
+- **Mycel** (`mycel.py`): central orchestrator — loads `mycel_config.yaml` + `spells.yaml`, builds Forges, per-forge queues, auto-resume, hot-reload, on-complete chains
+- **Forge** (`forge.py`): state machine — rituals, parallel spells (`asyncio.gather`), pre/post_run hooks, git prepare/finalize, output validation, caching, metrics, reviewer echo
+- **Runners** (`runner.py`): ClaudeRunner, GeminiRunner, CursorRunner with fallbacks. Token tracking. `cwd` is the workspace repo.
 - **MessageBus** (`message_bus.py`): async pub/sub, JSONL persistence
-- **Discord Bot** (`discord_bot.py`): dynamic commands (`!dev`, `!arcane`), slash commands, threads, interactive buttons, pinned dashboard, role permissions
+- **Discord Bot** (`discord_bot.py`): dynamic commands (`!dev`, `!mycel`), slash commands, threads, interactive buttons, pinned dashboard, role permissions
 
 ## Terminology
 
 | Concept | Name | Config key |
-|---|---|---|
-| Project | **Arcane** | — |
-| Execution environment | **Circle** | `circles:` |
-| Step/capability | **Spell** | `spells:` (skills.yaml) |
+|---------|------|------------|
+| Project / network | **Mycel** | — |
+| Execution environment | **Forge** | `forges:` (legacy: `circles:`) |
+| Step / capability | **Spell** | `spells:` in `spells.yaml` (legacy: `skills:`) |
 | Sequence of spells | **Ritual** | `ritual:` |
 | AI runner | **Familiar** | `familiar:` |
-| Global command | `!arcane` | — |
+| Global command | `!mycel` (alias: `!dispatch`) | — |
 | Reviewer feedback | **Echo** | `{reviewer_feedback}` |
 
-## Discord Commands
+Internal note: state-persistence keys in `bus/<forge>/state.json` keep the legacy `current_skill`, `step_outputs`, `skill_metrics` names for backwards compatibility — only the user-facing surface uses *spell*.
+
+## Discord commands
 
 ```
 !dev / !bugfix / !sentry / !hotfix / !devsecops / !discovery / !review <task>
-!<circle> skill <name> [instructions]   -> cast isolated spell (keyword is `skill`)
-!<circle> from <spell> [instructions]   -> restart from a spell, keep prior outputs
-!<circle> resume / retry / abort / reset / status / log [N]
-!arcane status / forges / skills / metrics / reload / reset
-!arcane sentry check | start | stop | status
+!<forge> spell <name> [instructions]   # isolated spell
+!<forge> from <spell> [instructions]   # resume from a spell, keep prior outputs
+!<forge> resume / retry / abort / reset / status / log [N]
+!<forge> reset metrics                 # reset state + zero skill_metrics + run_number
+!mycel status / forges / spells / metrics / mcp / reload / reset
+!mycel reset metrics                   # reset all forges + zero counters
+!mycel sentry check | start | stop | status
+!mycel aikido check | start | stop | status
 ```
 
-Slash commands: `/forge <circle> <task>`, `/skill <circle> <spell>`, `/arcane status|forges|skills|metrics|reload`.
+`!dispatch` is kept as a backwards-compat alias for `!mycel`. Subcommands accept legacy synonyms: `forges`/`workflow`/`circles`, `spells`/`skill`/`skills`. Inside a forge command, `spell`/`skill`/`step` are interchangeable.
 
-Note: config terms are **circles**/**spells**/**familiars**/**rituals**, but legacy command keywords (`skill`, `forges`, `/forge`) still use the old names.
+Slash: `/forge`, `/spell` (cast a spell on a forge), `/mycel` group (`status`, `forges`, `spells`, `metrics`, `mcp`, `reload`, `reset-metrics`).
+
+`!mycel mcp` runs `claude mcp list` and groups servers by health (connected / needs auth / failed). `reset metrics` zeroes `skill_metrics` and `run_number` (the persistent counters); plain `reset` only clears state to idle.
 
 ## Conventions
 
 - Python 3.9+ : `from __future__ import annotations`, `Optional[str]`
-- French prompts and messages
-- Loggers: `arcane.<module>` (arcane.core, arcane.circle, arcane.familiar, arcane.bus, arcane.discord)
-- No ANTHROPIC_API_KEY in runner env
-- Prompt via stdin, never CLI args
+- Prompts in `spells.yaml` may use French for product output; user-facing bot strings are English.
+- Loggers: `mycel.<module>` (mycel.core, mycel.forge, mycel.familiar, mycel.bus, mycel.discord)
+- No `ANTHROPIC_API_KEY` in runner env
+- Prompt via stdin, not CLI args
 - Template variables: `{task}`, `{instructions}`, `{previous_output}`, `{step_output_*}`, `{step_summary_*}`, `{reviewer_feedback}`, `{pre_run_output}`, `{post_run_output}`, `{mr_project}`, `{mr_iid}`
 
 ## Configuration
 
-- `arcane_config.yaml`: circles (with `channel`, `ritual`, `familiar`, `workspace_group`, `on_complete`), permissions, workspace_groups, repos
-- `skills.yaml`: spells with prompt, familiar, timeout, `required_fields`, `pre_run`, `post_run`, `git_prepare`, `git_finalize`
-- `.env`: DISCORD_BOT_TOKEN, GEMINI_API_KEY, WORKSPACE_FEATURE, WORKSPACE_BUG, WORKSPACE_SENTRY, WORKSPACE_REVIEW, DOCS_PATH, ISSUES_DIR
+- `mycel_config.yaml` (legacy: `dispatch_config.yaml`): `forges:` (legacy `circles:`) with `channel`, `ritual`, `familiar`, `workspace_group`, `on_complete`; `permissions`, `workspace_groups`, `repos`; `auto_resume_max_age_s` (top-level, default 1800 = 30 min) — paused-state recovery window; older state is *not* auto-resumed at startup. Set 0 to disable auto-resume entirely.
+- `spells.yaml` (legacy: `skills.yaml`): `spells:` (legacy `skills:`) — each spell: prompt, `runner`, timeout, `required_fields`, `pre_run`, `pre_run_timeout` (default 120s), `post_run`, `post_run_timeout` (default 300s), `git_prepare`, `git_finalize`
+- `.env`: `DISCORD_BOT_TOKEN`, `GEMINI_API_KEY`, `WORKSPACE_*` (e.g. `WORKSPACE_REMEDIATION` for `sentry` / `aikido` forges), `DOCS_PATH`, `ISSUES_DIR`, `REMEDIATION_AUTO_FIX` (`true`/`false`, overrides `auto_fix` on sentry+aikido monitors — `false` posts a "🔧 /fix <id>" button per new issue instead of auto-enqueuing)
 
-## Circles
+## Sentry monitor
 
-| Circle | Ritual | Channel | Familiar |
-|---|---|---|---|
-| dev | plan -> elaborate -> arch-review -> implement -> tech-review -> qa-scenario | #dev | claude |
-| bugfix | diagnose -> plan -> implement -> tech-review | #bugfix | claude |
-| sentry | diagnose -> plan -> implement -> tech-review (on_complete -> review) | #sentry | claude |
-| sentry-comments | diagnose -> elaborate -> implement | #sentry | claude |
-| hotfix | diagnose -> implement -> tech-review | #bugfix | claude |
-| devsecops | audit -> plan -> implement -> tech-review | #devsecops | cursor |
-| discovery | research -> elaborate -> plan | #discovery | claude |
-| review | mr-fetch -> parallel[mr-review, mr-review-arch, mr-review-quality] -> mr-summary | #reviews | claude |
+Background task: polls Sentry on `sentry_monitor.interval` and can auto-enqueue the `sentry` forge. Control: `!mycel sentry {check|start|stop|status}`. Config: `sentry_monitor:` in `mycel_config.yaml`. Code: `sentry_monitor.py`.
 
-Per-spell familiar overrides in `skills.yaml` (`runner:` key): arch-review and mr-review-arch -> gemini; tech-review and mr-review-quality -> cursor.
+## Aikido monitor
 
-## Sentry Monitor
-
-Background task that polls Sentry every `sentry_monitor.interval` seconds and auto-enqueues the `sentry` circle on new errors. Controlled via `!arcane sentry {check|start|stop|status}`. Config lives under `sentry_monitor:` in `arcane_config.yaml` (`enabled`, `interval`, `auto_fix`, `auto_fix_levels`). Code in `sentry_monitor.py`.
+Background task: polls Aikido on `aikido_monitor.interval` and can auto-enqueue the `aikido` forge for criticals. Control: `!mycel aikido {check|start|stop|status}`. Config: `aikido_monitor:` in `mycel_config.yaml`. Code: `aikido_monitor.py`.

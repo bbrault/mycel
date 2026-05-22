@@ -9,7 +9,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from forge import Circle, extract_json, safe_evaluate_condition, validate_output
+from forge import Forge, extract_json, safe_evaluate_condition, validate_output
 from message_bus import MessageBus
 
 
@@ -143,7 +143,7 @@ class TestSafeEvaluateCondition:
 
 
 class TestForgeBuildPrompt:
-    def _make_circle(self, bus_dir: str) -> Circle:
+    def _make_circle(self, bus_dir: str) -> Forge:
         bus = MessageBus(bus_dir=bus_dir)
         skills = {
             "plan": {
@@ -151,11 +151,11 @@ class TestForgeBuildPrompt:
                 "runner": "claude",
             },
         }
-        circle = Circle(
+        circle = Forge(
             name="test",
             description="test forge",
             workflow=["plan"],
-            skills=skills,
+            spells=skills,
             workspace={"api": "/path/to/api", "front": "/path/to/front"},
             bus=bus,
             bus_dir=bus_dir,
@@ -169,7 +169,7 @@ class TestForgeBuildPrompt:
         circle.state["task"] = "Build a feature"
         circle.state["instructions"] = "Use TypeScript"
 
-        prompt = circle._build_prompt(circle.skills["plan"])
+        prompt = circle._build_prompt(circle.spells["plan"])
 
         assert "Build a feature" in prompt
         assert "Use TypeScript" in prompt
@@ -182,7 +182,7 @@ class TestForgeBuildPrompt:
         circle.state["task"] = "x"
         circle.state["step_outputs"] = {"plan": "the plan output"}
 
-        prompt = circle._build_prompt(circle.skills["plan"])
+        prompt = circle._build_prompt(circle.spells["plan"])
         assert "the plan output" in prompt
 
     def test_missing_step_output_replaced(self) -> None:
@@ -190,7 +190,7 @@ class TestForgeBuildPrompt:
         circle = self._make_circle(tmp)
         circle.state["task"] = "x"
 
-        prompt = circle._build_prompt(circle.skills["plan"])
+        prompt = circle._build_prompt(circle.spells["plan"])
         assert "(non disponible)" in prompt
 
     def test_feedback_injection(self) -> None:
@@ -199,7 +199,7 @@ class TestForgeBuildPrompt:
         circle.state["task"] = "x"
         circle.inject_feedback("Please add tests")
 
-        prompt = circle._build_prompt(circle.skills["plan"])
+        prompt = circle._build_prompt(circle.spells["plan"])
         assert "Please add tests" in prompt
         # Buffer should be cleared
         assert len(circle._feedback_buffer) == 0
@@ -209,7 +209,7 @@ class TestForgeBuildPrompt:
         circle = self._make_circle(tmp)
         circle.state["task"] = "LAB-123 Ajouter la fonctionnalite X"
 
-        prompt = circle._build_prompt(circle.skills["plan"])
+        prompt = circle._build_prompt(circle.spells["plan"])
         assert "JIRA: LAB-123" in prompt
 
     def test_jira_id_kanta_format(self) -> None:
@@ -217,7 +217,7 @@ class TestForgeBuildPrompt:
         circle = self._make_circle(tmp)
         circle.state["task"] = "KANTA-456 Fix import CSV"
 
-        prompt = circle._build_prompt(circle.skills["plan"])
+        prompt = circle._build_prompt(circle.spells["plan"])
         assert "JIRA: KANTA-456" in prompt
 
     def test_no_jira_id(self) -> None:
@@ -225,7 +225,7 @@ class TestForgeBuildPrompt:
         circle = self._make_circle(tmp)
         circle.state["task"] = "Just a simple task"
 
-        prompt = circle._build_prompt(circle.skills["plan"])
+        prompt = circle._build_prompt(circle.spells["plan"])
         assert "JIRA: \n" in prompt or "JIRA: " in prompt
 
     def test_docs_path_substitution(self) -> None:
@@ -233,7 +233,7 @@ class TestForgeBuildPrompt:
         circle = self._make_circle(tmp)
         circle.state["task"] = "x"
 
-        prompt = circle._build_prompt(circle.skills["plan"])
+        prompt = circle._build_prompt(circle.spells["plan"])
         assert "/path/to/docs" in prompt
 
 
@@ -243,14 +243,14 @@ class TestForgeBuildPrompt:
 
 
 class TestForgeEvaluatePassCondition:
-    def _make_circle(self) -> Circle:
+    def _make_circle(self) -> Forge:
         tmp = tempfile.mkdtemp()
         bus = MessageBus(bus_dir=tmp)
-        return Circle(
+        return Forge(
             name="test",
             description="",
             workflow=[],
-            skills={},
+            spells={},
             workspace={},
             bus=bus,
             bus_dir=tmp,
@@ -292,14 +292,14 @@ class TestForgeEvaluatePassCondition:
 
 
 class TestMrUrlParsing:
-    def _make_circle(self, task: str = "") -> Circle:
+    def _make_circle(self, task: str = "") -> Forge:
         tmp = tempfile.mkdtemp()
         bus = MessageBus(bus_dir=tmp)
-        circle = Circle(
+        circle = Forge(
             name="review",
             description="test",
             workflow=[],
-            skills={},
+            spells={},
             workspace={},
             bus=bus,
             bus_dir=tmp,
@@ -350,7 +350,7 @@ class TestMrUrlParsing:
 
 
 class TestMrBuildPrompt:
-    def _make_circle(self, bus_dir: str) -> Circle:
+    def _make_circle(self, bus_dir: str) -> Forge:
         bus = MessageBus(bus_dir=bus_dir)
         skills = {
             "mr-review": {
@@ -358,11 +358,11 @@ class TestMrBuildPrompt:
                 "runner": "claude",
             },
         }
-        circle = Circle(
+        circle = Forge(
             name="review",
             description="test",
             workflow=["mr-review"],
-            skills=skills,
+            spells=skills,
             workspace={},
             bus=bus,
             bus_dir=bus_dir,
@@ -374,7 +374,7 @@ class TestMrBuildPrompt:
         circle = self._make_circle(tmp)
         circle.state["task"] = "https://gitlab.com/kanta/api/-/merge_requests/55"
 
-        prompt = circle._build_prompt(circle.skills["mr-review"])
+        prompt = circle._build_prompt(circle.spells["mr-review"])
         assert "Project: kanta/api" in prompt
         assert "IID: 55" in prompt
 
@@ -383,7 +383,7 @@ class TestMrBuildPrompt:
         circle = self._make_circle(tmp)
         circle.state["task"] = "LAB-123 Ajouter fonctionnalite"
 
-        prompt = circle._build_prompt(circle.skills["mr-review"])
+        prompt = circle._build_prompt(circle.spells["mr-review"])
         assert "Project: \n" in prompt or "Project: " in prompt
         assert "IID: \n" in prompt or "IID: " in prompt
 
@@ -394,14 +394,14 @@ class TestMrBuildPrompt:
 
 
 class TestMrIssueDir:
-    def _make_circle(self, task: str) -> Circle:
+    def _make_circle(self, task: str) -> Forge:
         tmp = tempfile.mkdtemp()
         bus = MessageBus(bus_dir=tmp)
-        circle = Circle(
+        circle = Forge(
             name="review",
             description="test",
             workflow=[],
-            skills={},
+            spells={},
             workspace={},
             bus=bus,
             bus_dir=tmp,

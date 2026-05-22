@@ -1,7 +1,7 @@
-# Arcane — Configuration des cercles d'invocation
-# Chemins resolus depuis .env : WORKSPACE_FEATURE, WORKSPACE_BUG, WORKSPACE_SENTRY, etc.
+# Dispatch — circle (workflow) configuration
+# Paths from .env: WORKSPACE_FEATURE, WORKSPACE_BUG, WORKSPACE_REMEDIATION, etc.
 
-# Noms de dossier des repos (identiques dans chaque workspace)
+# Repo folder names (same in each workspace)
 repos:
   api: kanta-api-v2
   front: kanta-front-v2
@@ -13,7 +13,7 @@ repos:
   query-spray: kanta-query-spray
   basique-api: basique-api
 
-# Groupes de workspace : chacun a son propre dossier de base (env var) et ses repos
+# Workspace groups: each has a base path (env var) and its repos
 workspace_groups:
   feature:
     base_env: WORKSPACE_FEATURE
@@ -21,9 +21,11 @@ workspace_groups:
   bug:
     base_env: WORKSPACE_BUG
     repos: [api, front, ui, connector, database, basique-api]
-  sentry:
-    base_env: WORKSPACE_SENTRY
-    repos: [api, basique-api]
+  # Security / incident / observability (Sentry + Aikido workflows) — one clone tree + git worktree per run
+  remediation:
+    base_env: WORKSPACE_REMEDIATION
+    repos: [api, front, infra, connector, database, basique-api]
+    git_worktree: true
   review:
     base_env: WORKSPACE_REVIEW
     repos: [api, front, ui, connector, database, basique-api]
@@ -38,7 +40,7 @@ defaults:
 
 # Claude CLI options
 claude:
-  allowed_tools: "mcp__claude_ai_Atlassian__*,mcp__claude_ai_Notion__*,mcp__claude_ai_Figma__*,mcp__claude_ai_Sentry__*,mcp__claude_ai_Slack__*"
+  allowed_tools: "mcp__claude_ai_Atlassian__*,mcp__claude_ai_Notion__*,mcp__claude_ai_Figma__*,mcp__claude_ai_Sentry__*,mcp__claude_ai_Slack__*,mcp__claude_ai_Aikido__*"
   permission_mode: "auto"
 
 # Sentry monitoring
@@ -49,31 +51,40 @@ sentry_monitor:
   auto_fix_levels:
     - fatal
 
-# Permissions par role Discord
+# Aikido monitoring (via Aikido MCP — mirrors Sentry)
+aikido_monitor:
+  enabled: true
+  interval: 3600
+  auto_fix: false
+  auto_fix_severities:
+    - critical
+  allowed_tools: "mcp__claude_ai_Aikido__*"
+
+# Discord role permissions
 permissions:
   default: all
   admin: all
   dev: [dev, bugfix, hotfix, review]
-  ops: [sentry, sentry-comments, devsecops]
+  ops: [sentry, sentry-comments, devsecops, aikido]
   product: [discovery]
 
-# Cercles d'invocation
-circles:
+# Forges (a forge is the execution environment for a ritual)
+forges:
   dev:
-    description: "Developpement de nouvelles fonctionnalites"
+    description: "New feature development"
     familiar: claude
     channel: dev
     workspace_group: feature
     ritual:
-      - plan
       - elaborate
+      - plan
       - arch-review
       - implement
       - tech-review
       - qa-scenario
 
   bugfix:
-    description: "Resolution de bugs — diagnostic, plan, correction et review"
+    description: "Bug resolution — diagnose, plan, fix, and review"
     familiar: claude
     channel: bugfix
     workspace_group: bug
@@ -84,29 +95,31 @@ circles:
       - tech-review
 
   sentry:
-    description: "Resolution d'erreurs Sentry — diagnostic et correction"
+    description: "Sentry error resolution — JIRA tracking, fix, plan, arch-review, implement, review"
     familiar: claude
     channel: sentry
-    workspace_group: sentry
+    workspace_group: remediation
     on_complete: review
     ritual:
-      - diagnose
+      - jira-create
+      - fix
       - plan
+      - arch-review
       - implement
       - tech-review
 
   sentry-comments:
-    description: "Traitement des commentaires Sentry — diagnostic, elaboration et correction"
+    description: "Sentry comment handling — diagnose, elaborate, and fix"
     familiar: claude
     channel: sentry
-    workspace_group: sentry
+    workspace_group: remediation
     ritual:
       - diagnose
       - elaborate
       - implement
 
   hotfix:
-    description: "Correction urgente — diagnostic rapide et correction"
+    description: "Urgent hotfix — quick diagnose and fix"
     familiar: claude
     channel: bugfix
     workspace_group: bug
@@ -116,7 +129,7 @@ circles:
       - tech-review
 
   devsecops:
-    description: "Audit securite + dependances Kanta (CVE, secrets, OWASP) puis plan de remediation et correction"
+    description: "Security and dependency audit (CVE, secrets, OWASP) then remediation plan and fixes"
     familiar: cursor
     channel: devsecops
     workspace_group: infra
@@ -126,18 +139,28 @@ circles:
       - implement
       - tech-review
 
+  aikido:
+    description: "Aikido finding remediation — fix and review"
+    familiar: claude
+    channel: aikido
+    workspace_group: remediation
+    ritual:
+      - fix
+      - implement
+      - tech-review
+
   discovery:
-    description: "Recherche de nouvelles features Kanta a partir de Notion / JIRA / repo"
+    description: "Feature discovery from a Claap recording → elaborate → plan"
     familiar: claude
     channel: discovery
     workspace_group: feature
     ritual:
-      - research
+      - claap-discovery
       - elaborate
       - plan
 
   review:
-    description: "Review multi-agents d'une Merge Request GitLab"
+    description: "Multi-agent merge request review (GitLab)"
     familiar: claude
     channel: reviews
     workspace_group: review
@@ -147,4 +170,5 @@ circles:
         - mr-review
         - mr-review-arch
         - mr-review-quality
+        - review-mr
       - mr-summary

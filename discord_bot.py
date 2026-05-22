@@ -2,19 +2,20 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
-from arcane import Arcane
+from forge import extract_json
+from mycel import Mycel
 from message_bus import Message
 
 load_dotenv()
 
-logger = logging.getLogger("arcane.discord")
+logger = logging.getLogger("mycel.discord")
 
 DISCORD_TOKEN: str = os.getenv("DISCORD_BOT_TOKEN", "")
 DEFAULT_CHANNEL = "agents"
@@ -42,12 +43,48 @@ def chunk_message(text: str) -> list[str]:
 Sendable = Union[discord.TextChannel, discord.Thread]
 
 
-class CircleControlView(discord.ui.View):
-    """Interactive buttons for forge pause actions (Resume / Retry / Reset)."""
+class MonitorAlertView(discord.ui.View):
+    """One button per actionable issue from a Sentry/Aikido monitor alert.
 
-    def __init__(self, arcane: Arcane, forge_name: str, show_push: bool = False) -> None:
+    Clicking a button enqueues the corresponding remediation forge with the
+    issue id+title as task. Used when REMEDIATION_AUTO_FIX=false so the
+    human stays in the loop before /fix runs.
+    """
+
+    def __init__(self, orchestrator: "Mycel", forge_name: str, issues: List[Dict[str, str]]) -> None:
+        super().__init__(timeout=86400)  # 24h — issues stay actionable for a day
+        self.orchestrator = orchestrator
+        self.forge_name = forge_name
+        for issue in issues:
+            issue_id = issue.get("id", "?")
+            label = f"🔧 /fix {issue_id}"[:80]
+            btn = discord.ui.Button(
+                label=label,
+                style=discord.ButtonStyle.primary,
+                custom_id=f"fix_{forge_name}_{issue_id}",
+            )
+            btn.callback = self._make_callback(issue.get("task", issue_id))
+            self.add_item(btn)
+
+    def _make_callback(self, task: str):
+        async def _cb(interaction: discord.Interaction) -> None:
+            await interaction.response.defer(thinking=True)
+            try:
+                await self.orchestrator.enqueue_forge(self.forge_name, task)
+                await interaction.followup.send(
+                    f"⚒️ **Forge {self.forge_name}** → enqueued `/fix` for `{task}`"
+                )
+            except Exception as exc:
+                await interaction.followup.send(f"❌ Could not enqueue: {exc}")
+        return _cb
+
+
+class ForgeControlView(discord.ui.View):
+    """Interactive buttons when a forge pauses (Resume / Retry / Reset)."""
+
+    def __init__(self, orchestrator: Mycel, forge_name: str, show_push: bool = False) -> None:
         super().__init__(timeout=3600)  # 1h timeout
-        self.arcane = arcane
+        self.orchestrator = orchestrator
         self.forge_name = forge_name
         if show_push:
             push_btn = discord.ui.Button(
@@ -59,54 +96,227 @@ class CircleControlView(discord.ui.View):
             push_btn.callback = self._push_callback
             self.add_item(push_btn)
 
-    @discord.ui.button(label="Resume", style=discord.ButtonStyle.blurple, emoji="\u25b6\ufe0f")
+    @discord.ui.button(label="Resume", style=discord.ButtonStyle.blurple, emoji="▶️")
     async def resume_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[type-arg]
-        self.arcane.resume_circle(self.forge_name)
+        await self.orchestrator.resume_forge(self.forge_name)
         await interaction.response.send_message(
-            f"\u25b6\ufe0f **Circle {self.forge_name}** \u2192 reprise du workflow",
+            f"▶️ **Forge {self.forge_name}** → workflow resumed",
         )
         self.stop()
 
     @discord.ui.button(label="Retry", style=discord.ButtonStyle.blurple, emoji="\U0001f504")
     async def retry_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[type-arg]
-        self.arcane.retry_circle(self.forge_name)
+        await self.orchestrator.retry_forge(self.forge_name)
         await interaction.response.send_message(
-            f"\U0001f504 **Circle {self.forge_name}** \u2192 relance du skill actuel",
+            f"\U0001f504 **Forge {self.forge_name}** → current step retried",
         )
         self.stop()
 
-    @discord.ui.button(label="Reset", style=discord.ButtonStyle.red, emoji="\U0001f5d1\ufe0f")
+    @discord.ui.button(label="Reset", style=discord.ButtonStyle.red, emoji="\U0001f5d1️")
     async def reset_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[type-arg]
-        self.arcane.reset_circle(self.forge_name)
+        self.orchestrator.reset_forge(self.forge_name)
         await interaction.response.send_message(
-            f"\U0001f5d1\ufe0f **Circle {self.forge_name}** \u2192 reinitialisee",
+            f"\U0001f5d1️ **Forge {self.forge_name}** → reset",
         )
         self.stop()
 
     async def _push_callback(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(thinking=True)
-        forge = self.arcane.circles.get(self.forge_name)
+        forge = self.orchestrator.forges.get(self.forge_name)
         if not forge:
-            await interaction.followup.send("\u274c Forge introuvable")
+            await interaction.followup.send("❌ Forge not found")
             return
         try:
             await forge._finalize_git(forge.state.get("current_skill", "implement"))
             await interaction.followup.send(
-                f"\U0001f680 **Circle {self.forge_name}** \u2192 Push + creation MR termines. Voir les messages ci-dessus pour les details.",
+                f"\U0001f680 **Forge {self.forge_name}** → Push + MR done. See messages above for details.",
             )
         except Exception as exc:
-            await interaction.followup.send(f"\u274c Push echoue : {exc}")
+            await interaction.followup.send(f"❌ Push failed: {exc}")
 
 
-class ArcaneBot(commands.Bot):
-    """Discord bot that drives the Arcane system."""
+class ClaapElaborateModal(discord.ui.Modal):
+    """Modal opened after picking an idea: collects optional notes, then resumes
+    the discovery workflow at /elaborate (which auto-advances to /plan)."""
+
+    def __init__(
+        self,
+        orchestrator: "Mycel",
+        forge_name: str,
+        idea_id: str,
+        idea_name: str,
+        idea_summary: str,
+    ) -> None:
+        super().__init__(title=f"Elaborate + Plan — {idea_id}"[:45])
+        self.orchestrator = orchestrator
+        self.forge_name = forge_name
+        self.idea_id = idea_id
+        self.idea_name = idea_name
+        self.idea_summary = idea_summary
+
+        self.notes = discord.ui.TextInput(
+            label="Notes / contraintes / scope (optionnel)",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=2000,
+            placeholder="Précisions, contraintes, périmètre à respecter…",
+        )
+        self.add_item(self.notes)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        notes = (self.notes.value or "").strip()
+        idea_label = f"{self.idea_id} ({self.idea_name})" if self.idea_name else self.idea_id
+        instructions_parts = [
+            f"Approfondis l'idée {idea_label} identifiée par /claap-discovery "
+            f"(le JSON complet est dans previous_output). "
+            f"Produis les specs fonctionnelles puis le plan technique pour CETTE idée uniquement.",
+        ]
+        if self.idea_summary:
+            instructions_parts.append(f"Résumé de l'idée : {self.idea_summary}")
+        if notes:
+            instructions_parts.append(f"Notes utilisateur :\n{notes}")
+        instructions = "\n\n".join(instructions_parts)
+
+        try:
+            await self.orchestrator.resume_forge(self.forge_name, instructions=instructions)
+        except Exception as exc:
+            await interaction.response.send_message(
+                f"❌ Could not resume forge: {exc}", ephemeral=True
+            )
+            return
+
+        await interaction.response.send_message(
+            f"✨ **Forge {self.forge_name}** → /elaborate + /plan lancés pour `{self.idea_id}`",
+        )
+
+
+class ClaapDiscoveryView(discord.ui.View):
+    """Post-/claap-discovery pause: select an idea → modal → resume ritual.
+
+    Falls back to plain Resume/Retry/Reset if no ideas are available.
+    """
+
+    def __init__(
+        self,
+        orchestrator: "Mycel",
+        forge_name: str,
+        ideas: List[Dict[str, Any]],
+        top_pick_id: Optional[str] = None,
+    ) -> None:
+        super().__init__(timeout=86400)
+        self.orchestrator = orchestrator
+        self.forge_name = forge_name
+        self._idea_meta: Dict[str, Dict[str, str]] = {}
+
+        options: List[discord.SelectOption] = []
+        for idea in ideas[:25]:
+            idea_id = str(idea.get("id") or "").strip() or f"IDEA-{len(options) + 1}"
+            name = str(idea.get("name") or "").strip() or "(sans titre)"
+            priority = str(idea.get("priority") or "?")
+            effort = str(idea.get("effort") or "?")
+            roi = (idea.get("roi") or {}).get("roi_score")
+            roi_str = f", ROI {roi}" if roi not in (None, "") else ""
+            label = f"{idea_id} — {name}"[:100]
+            description = f"priority {priority} · effort {effort}{roi_str}"[:100]
+            options.append(
+                discord.SelectOption(
+                    label=label,
+                    value=idea_id,
+                    description=description,
+                    default=(top_pick_id is not None and idea_id == top_pick_id),
+                )
+            )
+            self._idea_meta[idea_id] = {
+                "name": name,
+                "summary": str(idea.get("solution") or idea.get("problem") or "")[:500],
+            }
+
+        if options:
+            select = discord.ui.Select(
+                placeholder="✨ Choisir une idée pour /elaborate + /plan",
+                options=options,
+                custom_id=f"claap_idea_{forge_name}",
+                min_values=1,
+                max_values=1,
+            )
+            select.callback = self._on_select  # type: ignore[assignment]
+            self.add_item(select)
+
+    async def _on_select(self, interaction: discord.Interaction) -> None:
+        idea_id = (interaction.data or {}).get("values", [None])[0]  # type: ignore[index]
+        if not idea_id:
+            await interaction.response.send_message("❌ No idea selected", ephemeral=True)
+            return
+        meta = self._idea_meta.get(idea_id, {})
+        modal = ClaapElaborateModal(
+            self.orchestrator,
+            self.forge_name,
+            idea_id=idea_id,
+            idea_name=meta.get("name", ""),
+            idea_summary=meta.get("summary", ""),
+        )
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="Resume", style=discord.ButtonStyle.blurple, emoji="▶️", row=1)
+    async def resume_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[type-arg]
+        await self.orchestrator.resume_forge(self.forge_name)
+        await interaction.response.send_message(
+            f"▶️ **Forge {self.forge_name}** → workflow resumed",
+        )
+        self.stop()
+
+    @discord.ui.button(label="Retry", style=discord.ButtonStyle.blurple, emoji="\U0001f504", row=1)
+    async def retry_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[type-arg]
+        await self.orchestrator.retry_forge(self.forge_name)
+        await interaction.response.send_message(
+            f"\U0001f504 **Forge {self.forge_name}** → current step retried",
+        )
+        self.stop()
+
+    @discord.ui.button(label="Reset", style=discord.ButtonStyle.red, emoji="\U0001f5d1️", row=1)
+    async def reset_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[type-arg]
+        self.orchestrator.reset_forge(self.forge_name)
+        await interaction.response.send_message(
+            f"\U0001f5d1️ **Forge {self.forge_name}** → reset",
+        )
+        self.stop()
+
+
+def _build_claap_view(orchestrator: "Mycel", forge_name: str) -> Optional[ClaapDiscoveryView]:
+    """Read the latest /claap-discovery output from the forge and build the view.
+
+    Returns None if the output is missing or doesn't contain feature_ideas.
+    """
+    forge = orchestrator.forges.get(forge_name)
+    if not forge:
+        return None
+    output = forge.state.get("step_outputs", {}).get("claap-discovery")
+    if not output:
+        return None
+    data = extract_json(output)
+    if not data:
+        return None
+    ideas = data.get("feature_ideas") or []
+    if not isinstance(ideas, list) or not ideas:
+        return None
+    top_pick_id = ((data.get("top_pick") or {}).get("idea_id")) or None
+    return ClaapDiscoveryView(orchestrator, forge_name, ideas, top_pick_id=top_pick_id)
+
+
+def _forge_configs(orchestrator: Mycel) -> Dict[str, Dict]:
+    """Return the forges section from config, supporting legacy `circles:` key."""
+    return orchestrator.config.get("forges", orchestrator.config.get("circles", {})) or {}
+
+
+class MycelBot(commands.Bot):
+    """Discord bot that drives Mycel."""
 
     def __init__(self) -> None:
         intents = discord.Intents.default()
         intents.message_content = True
         super().__init__(command_prefix="!", intents=intents)
 
-        self.arcane = Arcane()
+        self.orchestrator = Mycel()
         # Multi-channel support: channel_name -> TextChannel
         self._channels: Dict[str, discord.TextChannel] = {}
         # Active thread per forge run: forge_name -> Thread
@@ -122,24 +332,25 @@ class ArcaneBot(commands.Bot):
         return self._channels.get(DEFAULT_CHANNEL)
 
     async def setup_hook(self) -> None:
-        self.arcane.bus.subscribe(self._on_bus_message)
-        await self.arcane.bus.start()
-        await self.arcane.start_worker()
-        await self.arcane.start_sentry_monitor()
+        self.orchestrator.bus.subscribe(self._on_bus_message)
+        await self.orchestrator.bus.start()
+        await self.orchestrator.start_worker()
+        await self.orchestrator.start_sentry_monitor()
+        await self.orchestrator.start_aikido_monitor()
         # Register slash commands
         _register_slash_commands(self)
         try:
             await self.tree.sync()
-            logger.info("Slash commands synchronisees")
+            logger.info("Slash commands synced")
         except Exception as exc:
-            logger.warning("Impossible de synchroniser les slash commands: %s", exc)
+            logger.warning("Could not sync slash commands: %s", exc)
 
     async def on_ready(self) -> None:
-        logger.info("Connecte en tant que %s", self.user)
+        logger.info("Connected as %s", self.user)
 
         # Collect all channel names from forge configs + default
         channel_names = {DEFAULT_CHANNEL}
-        for forge_cfg in self.arcane.config.get("forges", {}).values():
+        for forge_cfg in _forge_configs(self.orchestrator).values():
             ch = forge_cfg.get("channel")
             if ch:
                 channel_names.add(ch)
@@ -152,9 +363,9 @@ class ArcaneBot(commands.Bot):
 
         for name in channel_names:
             if name in self._channels:
-                logger.info("Canal #%s trouve", name)
+                logger.info("Channel #%s found", name)
             else:
-                logger.warning("Canal #%s introuvable — creez-le dans Discord", name)
+                logger.warning("Channel #%s not found — create it in Discord", name)
 
         if self.agents_channel:
             await self._send_welcome()
@@ -166,7 +377,7 @@ class ArcaneBot(commands.Bot):
 
     def _get_forge_channel_name(self, forge_name: str) -> str:
         """Return the Discord channel name configured for a forge."""
-        forge_cfg = self.arcane.config.get("forges", {}).get(forge_name, {})
+        forge_cfg = _forge_configs(self.orchestrator).get(forge_name, {})
         return forge_cfg.get("channel", DEFAULT_CHANNEL)
 
     def _get_forge_channel(self, forge_name: str) -> Optional[discord.TextChannel]:
@@ -184,26 +395,22 @@ class ArcaneBot(commands.Bot):
         Reuses an existing active (non-archived) thread for this forge
         instead of creating duplicates.
         """
-        # Reuse existing thread if still active
         existing = self._forge_threads.get(forge_name)
         if existing is not None:
             try:
-                # Check if thread is still alive and not archived
                 thread = existing.guild.get_thread(existing.id)  # type: ignore[union-attr]
                 if thread and not thread.archived:
-                    logger.info("Thread existant reutilise pour forge %s: %s", forge_name, thread.name)
+                    logger.info("Reusing thread for forge %s: %s", forge_name, thread.name)
                     return thread
             except Exception:
                 pass
-            # Thread gone or archived — remove reference
             self._forge_threads.pop(forge_name, None)
 
         channel = self._get_forge_channel(forge_name)
         if channel is None:
             return None
 
-        # Build thread name (Discord limit: 100 chars)
-        thread_name = f"\U0001f527 {forge_name} \u2014 {task[:80]}"
+        thread_name = f"⚒️ {forge_name} — {task[:80]}"
         if len(thread_name) > 100:
             thread_name = thread_name[:97] + "..."
 
@@ -214,10 +421,10 @@ class ArcaneBot(commands.Bot):
                 auto_archive_duration=1440,  # 24h
             )
             self._forge_threads[forge_name] = thread
-            logger.info("Thread cree pour forge %s: %s", forge_name, thread_name)
+            logger.info("Thread created for forge %s: %s", forge_name, thread_name)
             return thread
         except Exception as exc:
-            logger.error("Erreur creation thread pour forge %s: %s", forge_name, exc)
+            logger.error("Thread creation error for forge %s: %s", forge_name, exc)
             return None
 
     def _get_send_target(self, forge_name: str = "") -> Optional[Sendable]:
@@ -239,7 +446,7 @@ class ArcaneBot(commands.Bot):
                 try:
                     await target.send(chunk)
                 except Exception as exc:
-                    logger.error("Erreur envoi Discord: %s", exc)
+                    logger.error("Discord send error: %s", exc)
 
     async def _send_to_channel(self, text: str) -> None:
         """Send to the default agents channel (welcome, crew commands)."""
@@ -254,7 +461,7 @@ class ArcaneBot(commands.Bot):
     async def _on_bus_message(self, message: Message) -> None:
         target = self._get_send_target(message.forge_name)
         if target is None:
-            logger.warning("Bus message ignore (pas de cible): %s", message.content[:80])
+            logger.warning("Bus message ignored (no target): %s", message.content[:80])
             return
         logger.debug("Discord <- [%s] %s", message.forge_name, message.content[:80])
 
@@ -276,10 +483,10 @@ class ArcaneBot(commands.Bot):
                     sent = await target.send(message.content[:1900])
                     self._streaming_messages[stream_id] = sent
             except Exception as exc:
-                logger.debug("Streaming edit echoue: %s", exc)
+                logger.debug("Streaming edit failed: %s", exc)
             return
 
-        # Clean up streaming message when skill finishes (non-streaming message arrives)
+        # Clean up streaming message when spell finishes (non-streaming message arrives)
         if message.forge_name:
             for sid in list(self._streaming_messages):
                 if sid.startswith(f"{message.forge_name}_"):
@@ -287,14 +494,43 @@ class ArcaneBot(commands.Bot):
 
         # If this is a pause message, send with interactive buttons
         if message.data.get("paused") and message.forge_name:
-            skill_name = message.data.get("skill_name", "")
-            skill_cfg = self.arcane.spells_config.get(skill_name, {})
-            show_push = skill_cfg.get("git_prepare", False)
-            view = CircleControlView(self.arcane, message.forge_name, show_push=show_push)
+            spell_name = message.data.get("skill_name", "")
+            spell_cfg = self.orchestrator.spells_config.get(spell_name, {})
+            show_push = spell_cfg.get("git_prepare", False)
+            view: discord.ui.View
+            if spell_name == "claap-discovery":
+                claap_view = _build_claap_view(self.orchestrator, message.forge_name)
+                view = claap_view if claap_view is not None else ForgeControlView(
+                    self.orchestrator, message.forge_name, show_push=show_push
+                )
+            else:
+                view = ForgeControlView(self.orchestrator, message.forge_name, show_push=show_push)
             try:
                 await target.send(message.content, view=view)
             except Exception as exc:
-                logger.error("Erreur envoi boutons Discord: %s", exc)
+                logger.error("Discord button send error: %s", exc)
+                await self._send_to_target(message.content, target)
+        elif message.data.get("monitor_alert"):
+            forge = message.data.get("forge", message.forge_name or "")
+            issues = message.data.get("actionable_issues") or []
+            if forge and issues and forge in self.orchestrator.forges:
+                view = MonitorAlertView(self.orchestrator, forge, issues)
+                # Buttons must travel with the last chunk; send chunks then the
+                # final one with the view attached.
+                chunks = chunk_message(message.content)
+                head, last = chunks[:-1], chunks[-1]
+                for chunk in head:
+                    if chunk.strip():
+                        try:
+                            await target.send(chunk)
+                        except Exception as exc:
+                            logger.error("Discord send error: %s", exc)
+                try:
+                    await target.send(last, view=view)
+                except Exception as exc:
+                    logger.error("Discord button send error: %s", exc)
+                    await self._send_to_target(message.content, target)
+            else:
                 await self._send_to_target(message.content, target)
         else:
             await self._send_to_target(message.content, target)
@@ -305,11 +541,11 @@ class ArcaneBot(commands.Bot):
             try:
                 file = discord.File(output_file, filename=os.path.basename(output_file))
                 await target.send(
-                    f"\U0001f4ce Fichier : `{os.path.basename(output_file)}`",
+                    f"\U0001f4ce File: `{os.path.basename(output_file)}`",
                     file=file,
                 )
             except Exception as exc:
-                logger.error("Erreur upload fichier Discord: %s", exc)
+                logger.error("Discord file upload error: %s", exc)
 
     # ------------------------------------------------------------------
     # Welcome message
@@ -320,14 +556,13 @@ class ArcaneBot(commands.Bot):
         if self.agents_channel is None:
             return
 
-        # Build compact dashboard with progress bars
-        lines = ["\U0001f9e0 **Arcane Grimoire**\n"]
-        for name, forge in self.arcane.circles.items():
+        lines = ["\U0001f344 **Mycel dashboard**\n"]
+        for name, forge in self.orchestrator.forges.items():
             lines.append(forge.progress_bar)
 
-        queue_total = self.arcane.queue_size
+        queue_total = self.orchestrator.queue_size
         if queue_total > 0:
-            lines.append(f"\n\U0001f4cb File d'attente : {queue_total} tache(s)")
+            lines.append(f"\n\U0001f4cb Queue: {queue_total} task(s)")
 
         content = "\n".join(lines)
 
@@ -341,45 +576,48 @@ class ArcaneBot(commands.Bot):
                 except Exception:
                     pass  # Pin might fail if no permission
         except discord.NotFound:
-            # Message was deleted, recreate
             self._dashboard_msg = await self.agents_channel.send(content)
         except Exception as exc:
-            logger.debug("Dashboard update echoue: %s", exc)
+            logger.debug("Dashboard update failed: %s", exc)
 
     async def _send_welcome(self) -> None:
         forges_list = "\n".join(
-            f"\u2022 `!{name}` \u2014 {forge.description} (#{self._get_forge_channel_name(name)})"
-            for name, forge in self.arcane.circles.items()
+            f"• `!{name}` — {forge.description} (#{self._get_forge_channel_name(name)})"
+            for name, forge in self.orchestrator.forges.items()
         )
-        check = "\u2705"
-        cross = "\u274c"
-        runners = ", ".join(
+        check = "✅"
+        cross = "❌"
+        familiars = ", ".join(
             f"{k}: {check if v else cross}"
-            for k, v in self.arcane.familiar_status.items()
+            for k, v in self.orchestrator.familiar_status.items()
         )
 
         channels_str = ", ".join(f"#{name}" for name in sorted(self._channels.keys()))
 
         welcome = (
-            "\U0001f9e0 **Arcane en ligne**\n\n"
-            f"**Runners :** {runners}\n"
-            f"**Canaux :** {channels_str}\n\n"
-            f"**Forges disponibles :**\n{forges_list}\n\n"
-            "**Commandes :**\n"
-            "\u2022 `!<forge> <description>` \u2192 lancer le workflow (cree un thread)\n"
-            "\u2022 `!<forge> skill <skill> [instructions]` \u2192 executer un skill isole\n"
-            "\u2022 `!<forge> from <skill>` \u2192 reprendre depuis une etape\n"
-            "\u2022 `!<forge> resume [instructions]` \u2192 reprendre apres une pause\n"
-            "\u2022 `!<forge> retry [instructions]` \u2192 relancer le skill actuel\n"
-            "\u2022 `!<forge> status` \u2192 progression du workflow\n"
-            "\u2022 `!<forge> log [N]` \u2192 derniers N messages\n"
-            "\u2022 `!<forge> reset` \u2192 reset une forge\n"
-            "\u2022 `!crew status` \u2192 etat global\n"
-            "\u2022 `!crew forges` \u2192 liste des forges\n"
-            "\u2022 `!crew skills` \u2192 liste des skills\n"
-            "\u2022 `!crew sentry [check|start|stop|status]` \u2192 monitoring Sentry\n"
-            "\u2022 `!crew reset` \u2192 reset toutes les forges\n\n"
-            "Envoyez un message dans un thread actif pour injecter du feedback."
+            "\U0001f344 **Mycel online**\n\n"
+            f"**Agents:** {familiars}\n"
+            f"**Channels:** {channels_str}\n\n"
+            f"**Forges:**\n{forges_list}\n\n"
+            "**Commands:**\n"
+            "• `!<forge> <description>` (e.g. `!dev`) → start workflow (creates a thread)\n"
+            "• `!<forge> step <name> [instructions]` → run a single step\n"
+            "• `!<forge> from <step>` → resume from a step\n"
+            "• `!<forge> resume [instructions]` → resume after a pause\n"
+            "• `!<forge> retry [instructions]` → retry current step\n"
+            "• `!<forge> status` → progress for this forge\n"
+            "• `!<forge> sync` → refresh git + GitLab (MR/pipeline) state\n"
+            "• `!<forge> log [N]` → last N bus messages\n"
+            "• `!<forge> reset` → reset this forge\n"
+            "• `!mycel status` → global status\n"
+            "• `!mycel forges` → list configured forges\n"
+            "• `!mycel steps` → list available steps\n"
+            "• `!mycel mcp` → check MCP server health\n"
+            "• `!mycel sentry [check|start|stop|status]` → Sentry monitor\n"
+            "• `!mycel aikido [check|start|stop|status]` → Aikido monitor\n"
+            "• `!mycel reset` → reset all forges\n"
+            "• `!mycel reset metrics` → reset all forges + zero counters\n\n"
+            "Reply in an active thread to add context for the next step."
         )
         await self._send_to_channel(welcome)
 
@@ -389,7 +627,7 @@ class ArcaneBot(commands.Bot):
 
     def _check_permission(self, member: discord.Member, forge_name: str) -> bool:
         """Check if a member has permission to use a forge based on role config."""
-        permissions = self.arcane.config.get("permissions", {})
+        permissions = self.orchestrator.config.get("permissions", {})
         if not permissions:
             return True  # No permissions configured -> allow all
 
@@ -406,7 +644,6 @@ class ArcaneBot(commands.Bot):
             if isinstance(allowed, list) and forge_name in allowed:
                 return True
 
-        # No role matched -> check default policy
         if not matched:
             default = permissions.get("default", "all")
             if default == "all":
@@ -429,7 +666,7 @@ class ArcaneBot(commands.Bot):
         action_lower = rest.split()[0].lower() if rest.strip() else ""
         if action_lower not in ("status", "log") and isinstance(message.author, discord.Member):
             if not self._check_permission(message.author, forge_name):
-                await channel.send(f"\U0001f6ab Vous n'avez pas la permission d'utiliser la forge **{forge_name}**.")
+                await channel.send(f"\U0001f6ab You are not allowed to use forge **{forge_name}**.")
                 return
 
         parts = rest.split(maxsplit=1) if rest else []
@@ -438,23 +675,41 @@ class ArcaneBot(commands.Bot):
         args = parts[1] if len(parts) > 1 else ""
 
         if action_lower == "status":
-            status = self.arcane.get_circle_status(forge_name)
+            status = await self.orchestrator.get_forge_status(forge_name)
             target = self._get_send_target(forge_name)
             if target:
                 await self._send_to_target(status, target)
             else:
                 await channel.send(status)
 
+        elif action_lower == "sync":
+            target = self._get_send_target(forge_name)
+            ack = f"🔄 **Forge {forge_name}** → syncing with GitLab…"
+            if target:
+                await self._send_to_target(ack, target)
+            else:
+                await channel.send(ack)
+            status = await self.orchestrator.sync_forge(forge_name)
+            if target:
+                await self._send_to_target(status, target)
+            else:
+                await channel.send(status)
+
         elif action_lower == "reset":
-            self.arcane.reset_circle(forge_name)
-            self._forge_threads.pop(forge_name, None)
-            await channel.send(f"\U0001f527 **Circle {forge_name}** \u2192 reinitialisee.")
+            if args.strip().lower() == "metrics":
+                self.orchestrator.reset_forge_metrics(forge_name)
+                self._forge_threads.pop(forge_name, None)
+                await channel.send(f"\U0001f4ca **Forge {forge_name}** → metrics reset (counters zeroed).")
+            else:
+                self.orchestrator.reset_forge(forge_name)
+                self._forge_threads.pop(forge_name, None)
+                await channel.send(f"⚒️ **Forge {forge_name}** → reset.")
 
         elif action_lower == "log":
             limit = 20
             if args.strip().isdigit():
                 limit = int(args.strip())
-            log_text = self.arcane.get_circle_log(forge_name, limit=limit)
+            log_text = self.orchestrator.get_forge_log(forge_name, limit=limit)
             target = self._get_send_target(forge_name)
             if target:
                 await self._send_to_target(log_text, target)
@@ -463,77 +718,83 @@ class ArcaneBot(commands.Bot):
 
         elif action_lower == "from":
             if not args:
-                await channel.send(f"Usage : `!{forge_name} from <skill> [instructions]`")
+                await channel.send(f"Usage: `!{forge_name} from <step> [instructions]`")
                 return
             from_parts = args.split(maxsplit=1)
-            from_skill = from_parts[0]
+            from_spell = from_parts[0]
             from_instructions = from_parts[1] if len(from_parts) > 1 else None
 
-            forge = self.arcane.circles[forge_name]
-            if from_skill not in forge.workflow:
-                available_skills = " \u2192 ".join(forge.workflow)
-                await channel.send(f"Skill `/{from_skill}` pas dans le workflow. Disponibles : {available_skills}")
+            forge = self.orchestrator.forges[forge_name]
+            if from_spell not in forge._all_skill_names():
+                available = forge.format_workflow()
+                await channel.send(f"Step `/{from_spell}` is not in this workflow. Available: {available}")
                 return
 
-            task = forge.state.get("task") or "reprise"
+            task = forge.state.get("task") or "resume"
             thread = await self._create_forge_thread(forge_name, task)
 
-            idx = forge.workflow.index(from_skill)
+            idx = forge._find_skill_workflow_index(from_spell)
+
+            def _render_step(step) -> str:
+                if isinstance(step, dict) and "parallel" in step:
+                    return "(" + " | ".join(f"`/{n}`" for n in step["parallel"]) + ")"
+                return f"`/{step}`"
+
             kept = forge.workflow[:idx]
             rerun = forge.workflow[idx:]
-            kept_str = ", ".join(f"\u2705 `/{s}`" for s in kept) if kept else "(rien)"
-            rerun_str = " \u2192 ".join(f"`/{s}`" for s in rerun)
+            kept_str = ", ".join(f"✅ {_render_step(s)}" for s in kept) if kept else "(none)"
+            rerun_str = " → ".join(_render_step(s) for s in rerun)
 
-            await self.arcane.enqueue_from_spell(forge_name, from_skill, from_instructions)
+            await self.orchestrator.enqueue_from_spell(forge_name, from_spell, from_instructions)
 
             msg = (
-                f"\U0001f504 **Circle {forge_name}** \u2192 reprise depuis `/{from_skill}`\n"
-                f"\U0001f4e6 Conserve : {kept_str}\n"
-                f"\U0001f501 Relance : {rerun_str}"
+                f"\U0001f504 ⚒️ **Forge {forge_name}** → resuming from `/{from_spell}`\n"
+                f"\U0001f4e6 Kept: {kept_str}\n"
+                f"\U0001f501 Re-runs: {rerun_str}"
             )
             await channel.send(msg)
             if thread:
                 await self._send_to_target(msg, thread)
 
         elif action_lower == "resume":
-            if self.arcane.circles[forge_name].state["status"] != "paused":
-                await channel.send(f"\U0001f527 **Circle {forge_name}** n'est pas en pause.")
+            if self.orchestrator.forges[forge_name].state["status"] != "paused":
+                await channel.send(f"⚒️ **Forge {forge_name}** is not paused.")
                 return
-            self.arcane.resume_circle(forge_name, instructions=args or None)
-            await channel.send(f"\u25b6\ufe0f **Circle {forge_name}** \u2192 reprise du workflow")
+            await self.orchestrator.resume_forge(forge_name, instructions=args or None)
+            await channel.send(f"▶️ **Forge {forge_name}** → workflow resumed")
 
         elif action_lower == "abort":
-            aborted = self.arcane.abort_circle(forge_name)
+            aborted = self.orchestrator.abort_forge(forge_name)
             if aborted:
-                await channel.send(f"\U0001f6d1 **Circle {forge_name}** \u2192 skill en cours avorte. Utilisez `!{forge_name} from <skill>` pour reprendre.")
+                await channel.send(f"\U0001f6d1 **Forge {forge_name}** → current step aborted. Use `!{forge_name} from <step>` to continue.")
             else:
-                await channel.send(f"\U0001f527 **Circle {forge_name}** n'est pas en cours d'execution.")
+                await channel.send(f"⚒️ **Forge {forge_name}** is not running.")
 
         elif action_lower == "retry":
-            if self.arcane.circles[forge_name].state["status"] not in ("paused", "failed", "error"):
-                await channel.send(f"\U0001f527 **Circle {forge_name}** n'est pas en pause ou en erreur.")
+            if self.orchestrator.forges[forge_name].state["status"] not in ("paused", "failed", "error"):
+                await channel.send(f"⚒️ **Forge {forge_name}** is not paused or in error state.")
                 return
-            self.arcane.retry_circle(forge_name, instructions=args or None)
-            await channel.send(f"\U0001f504 **Circle {forge_name}** \u2192 relance du skill actuel")
+            await self.orchestrator.retry_forge(forge_name, instructions=args or None)
+            await channel.send(f"\U0001f504 **Forge {forge_name}** → current step retried")
 
-        elif action_lower == "skill":
-            skill_parts = args.split(maxsplit=1) if args else []
-            if not skill_parts:
-                await channel.send(f"Usage : `!{forge_name} skill <skill_name> [instructions]`")
+        elif action_lower in ("spell", "skill", "step"):
+            spell_parts = args.split(maxsplit=1) if args else []
+            if not spell_parts:
+                await channel.send(f"Usage: `!{forge_name} step <step_name> [instructions]`")
                 return
-            skill_name = skill_parts[0]
-            skill_instructions = skill_parts[1] if len(skill_parts) > 1 else None
+            spell_name = spell_parts[0]
+            spell_instructions = spell_parts[1] if len(spell_parts) > 1 else None
 
-            if skill_name not in self.arcane.spells_config:
-                available_skills = ", ".join(self.arcane.spells_config.keys())
-                await channel.send(f"Spell inconnu : `{skill_name}`. Disponibles : {available_skills}")
+            if spell_name not in self.orchestrator.spells_config:
+                available = ", ".join(self.orchestrator.spells_config.keys())
+                await channel.send(f"Unknown step: `{spell_name}`. Available: {available}")
                 return
 
-            task = skill_instructions or f"Execution isolee de /{skill_name} sur la forge {forge_name}"
-            thread = await self._create_forge_thread(forge_name, f"/{skill_name} \u2014 {task[:60]}")
+            task = spell_instructions or f"Isolated run of /{spell_name} on forge {forge_name}"
+            thread = await self._create_forge_thread(forge_name, f"/{spell_name} — {task[:60]}")
 
-            await self.arcane.enqueue_circle_spell(forge_name, skill_name, task, instructions=skill_instructions)
-            msg = f"\U0001f9e0 **Circle {forge_name}** \u2192 skill `/{skill_name}` accepte"
+            await self.orchestrator.enqueue_forge_spell(forge_name, spell_name, task, instructions=spell_instructions)
+            msg = f"⚒️ **Forge {forge_name}** → step `/{spell_name}` enqueued"
             await channel.send(msg)
             if thread:
                 await self._send_to_target(msg, thread)
@@ -542,16 +803,16 @@ class ArcaneBot(commands.Bot):
             # Everything else is treated as the task description
             task = f"{action} {args}".strip() if action else rest.strip()
             if not task:
-                await channel.send(f"Usage : `!{forge_name} <description de la tache>`")
+                await channel.send(f"Usage: `!{forge_name} <task description>`")
                 return
 
             thread = await self._create_forge_thread(forge_name, task)
 
-            position = await self.arcane.enqueue_circle(forge_name, task)
-            forge = self.arcane.circles[forge_name]
-            workflow_str = " \u2192 ".join(f"`/{s}`" for s in forge.workflow)
+            await self.orchestrator.enqueue_forge(forge_name, task)
+            forge = self.orchestrator.forges[forge_name]
+            ritual_str = forge.format_workflow()
 
-            msg = f"\U0001f9e0 **Circle {forge_name}** \u2192 tache acceptee\n\U0001f4cb Workflow : {workflow_str}\n\U0001f4dd Tache : {task}"
+            msg = f"⚒️ **Forge {forge_name}** → task accepted\n\U0001f4cb Workflow: {ritual_str}\n\U0001f4dd Task: {task}"
             await channel.send(msg)
             if thread:
                 await self._send_to_target(msg, thread)
@@ -569,37 +830,35 @@ class ArcaneBot(commands.Bot):
             raw = message.content[1:].strip()
             word = raw.split()[0] if raw else ""
 
-            if word in self.arcane.circles:
+            if word in self.orchestrator.forges:
                 # Dynamic forge command: !dev, !bugfix, !sentry, etc.
                 rest = raw[len(word):].strip()
                 try:
                     await self._handle_forge_command(message, word, rest)
                 except Exception as exc:
-                    logger.error("Erreur commande forge %s: %s", word, exc, exc_info=True)
-                    await message.channel.send(f"\u274c Erreur : {exc}")
+                    logger.error("Forge command error %s: %s", word, exc, exc_info=True)
+                    await message.channel.send(f"❌ Error: {exc}")
                 return
 
-            # Not a forge command — let discord.py handle it (!crew, etc.)
+            # Not a forge command — let discord.py handle it (!mycel, !dispatch alias, etc.)
             await self.process_commands(message)
             return
 
         # Free-form message (no !) — inject as feedback
-        # Check if message is in an active forge thread -> targeted feedback
         for forge_name, thread in self._forge_threads.items():
             if message.channel.id == thread.id:
-                forge = self.arcane.circles.get(forge_name)
+                forge = self.orchestrator.forges.get(forge_name)
                 if forge and forge.state["status"] in ("running", "paused"):
-                    self.arcane.inject_feedback(forge_name, message.content)
+                    self.orchestrator.inject_feedback(forge_name, message.content)
                     await message.add_reaction("\U0001f4dd")
                 break
         else:
-            # Message in a channel (not a thread) -> legacy behavior
             channel_ids = {ch.id for ch in self._channels.values()}
-            if message.channel.id in channel_ids and self.arcane.task_running:
-                for forge in self.arcane.circles.values():
+            if message.channel.id in channel_ids and self.orchestrator.task_running:
+                for forge in self.orchestrator.forges.values():
                     if forge.state["status"] in ("running", "paused"):
                         if forge.name not in self._forge_threads:
-                            self.arcane.inject_feedback(forge.name, message.content)
+                            self.orchestrator.inject_feedback(forge.name, message.content)
                             await message.add_reaction("\U0001f4dd")
                             break
 
@@ -608,139 +867,203 @@ class ArcaneBot(commands.Bot):
 # Slash commands registration
 # ------------------------------------------------------------------
 
-def _register_slash_commands(bot_instance: ArcaneBot) -> None:
+def _register_slash_commands(bot_instance: MycelBot) -> None:
     """Register slash commands on the bot's command tree."""
     tree = bot_instance.tree
 
     async def _forge_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
-        forges = list(bot_instance.arcane.circles.keys())
+        forges = list(bot_instance.orchestrator.forges.keys())
         return [
             app_commands.Choice(name=f, value=f)
             for f in forges if current.lower() in f.lower()
         ][:25]
 
-    async def _skill_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
-        skills = list(bot_instance.arcane.spells_config.keys())
+    async def _spell_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+        spells = list(bot_instance.orchestrator.spells_config.keys())
         return [
             app_commands.Choice(name=s, value=s)
-            for s in skills if current.lower() in s.lower()
+            for s in spells if current.lower() in s.lower()
         ][:25]
 
-    @tree.command(name="forge", description="Lancer un workflow sur une forge")
+    @tree.command(name="forge", description="Start a workflow on a forge")
     @app_commands.describe(
-        forge_name="Nom de la forge",
-        task="Description de la tache ou URL de MR",
+        forge_name="Forge name",
+        task="Task description or MR URL",
     )
     @app_commands.autocomplete(forge_name=_forge_autocomplete)
     async def slash_forge(interaction: discord.Interaction, forge_name: str, task: str) -> None:
-        if forge_name not in bot_instance.arcane.circles:
-            await interaction.response.send_message(f"Circle inconnu : `{forge_name}`", ephemeral=True)
+        if forge_name not in bot_instance.orchestrator.forges:
+            await interaction.response.send_message(f"Unknown forge: `{forge_name}`", ephemeral=True)
             return
         thread = await bot_instance._create_forge_thread(forge_name, task)
-        await bot_instance.arcane.enqueue_circle(forge_name, task)
-        forge = bot_instance.arcane.circles[forge_name]
-        workflow_str = " \u2192 ".join(f"`/{s}`" for s in forge._all_skill_names())
-        msg = f"\U0001f9e0 **Circle {forge_name}** \u2192 tache acceptee\n\U0001f4cb Workflow : {workflow_str}\n\U0001f4dd Tache : {task}"
+        await bot_instance.orchestrator.enqueue_forge(forge_name, task)
+        forge = bot_instance.orchestrator.forges[forge_name]
+        ritual_str = forge.format_workflow()
+        msg = f"⚒️ **Forge {forge_name}** → task accepted\n\U0001f4cb Workflow: {ritual_str}\n\U0001f4dd Task: {task}"
         await interaction.response.send_message(msg)
         if thread:
             await bot_instance._send_to_target(msg, thread)
 
-    @tree.command(name="skill", description="Executer un skill isole sur une forge")
+    @tree.command(name="spell", description="Run a single step on a forge")
     @app_commands.describe(
-        forge_name="Nom de la forge",
-        skill_name="Nom du skill",
-        instructions="Instructions optionnelles",
+        forge_name="Forge name",
+        spell_name="Step name (e.g. plan, implement)",
+        instructions="Optional instructions",
     )
-    @app_commands.autocomplete(forge_name=_forge_autocomplete, skill_name=_skill_autocomplete)
-    async def slash_skill(interaction: discord.Interaction, forge_name: str, skill_name: str, instructions: Optional[str] = None) -> None:
-        if forge_name not in bot_instance.arcane.circles:
-            await interaction.response.send_message(f"Circle inconnu : `{forge_name}`", ephemeral=True)
+    @app_commands.autocomplete(forge_name=_forge_autocomplete, spell_name=_spell_autocomplete)
+    async def slash_spell(interaction: discord.Interaction, forge_name: str, spell_name: str, instructions: Optional[str] = None) -> None:
+        if forge_name not in bot_instance.orchestrator.forges:
+            await interaction.response.send_message(f"Unknown forge: `{forge_name}`", ephemeral=True)
             return
-        if skill_name not in bot_instance.arcane.spells_config:
-            await interaction.response.send_message(f"Spell inconnu : `{skill_name}`", ephemeral=True)
+        if spell_name not in bot_instance.orchestrator.spells_config:
+            await interaction.response.send_message(f"Unknown step: `{spell_name}`", ephemeral=True)
             return
-        task = instructions or f"Execution isolee de /{skill_name}"
-        thread = await bot_instance._create_forge_thread(forge_name, f"/{skill_name} \u2014 {task[:60]}")
-        await bot_instance.arcane.enqueue_circle_spell(forge_name, skill_name, task, instructions=instructions)
-        msg = f"\U0001f9e0 **Circle {forge_name}** \u2192 skill `/{skill_name}` accepte"
+        task = instructions or f"Isolated run of /{spell_name}"
+        thread = await bot_instance._create_forge_thread(forge_name, f"/{spell_name} — {task[:60]}")
+        await bot_instance.orchestrator.enqueue_forge_spell(forge_name, spell_name, task, instructions=instructions)
+        msg = f"⚒️ **Forge {forge_name}** → step `/{spell_name}` enqueued"
         await interaction.response.send_message(msg)
         if thread:
             await bot_instance._send_to_target(msg, thread)
 
-    arcane_group = app_commands.Group(name="arcane", description="Commandes globales Arcane")
+    mycel_group = app_commands.Group(name="mycel", description="Global Mycel commands")
 
-    @arcane_group.command(name="status", description="Etat global de Arcane")
-    async def slash_crew_status(interaction: discord.Interaction) -> None:
-        status = bot_instance.arcane.get_global_status()
-        await interaction.response.send_message(status)
+    @mycel_group.command(name="status", description="Global Mycel status")
+    async def slash_mycel_status(interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
+        status = await bot_instance.orchestrator.get_global_status()
+        await interaction.followup.send(status)
 
-    @arcane_group.command(name="forges", description="Liste des forges disponibles")
-    async def slash_crew_forges(interaction: discord.Interaction) -> None:
-        await interaction.response.send_message(bot_instance.arcane.list_circles())
+    @mycel_group.command(name="sync", description="Sync a forge with GitLab (MR + pipeline state)")
+    async def slash_mycel_sync(interaction: discord.Interaction, forge_name: str) -> None:
+        await interaction.response.defer()
+        status = await bot_instance.orchestrator.sync_forge(forge_name)
+        await interaction.followup.send(status)
 
-    @arcane_group.command(name="skills", description="Liste des skills disponibles")
-    async def slash_crew_skills(interaction: discord.Interaction) -> None:
-        await interaction.response.send_message(bot_instance.arcane.list_spells())
+    @mycel_group.command(name="forges", description="List configured forges")
+    async def slash_mycel_forges(interaction: discord.Interaction) -> None:
+        await interaction.response.send_message(bot_instance.orchestrator.list_forges())
 
-    @arcane_group.command(name="metrics", description="Metriques d'execution")
-    async def slash_crew_metrics(interaction: discord.Interaction) -> None:
-        await interaction.response.send_message(bot_instance.arcane.get_metrics())
+    @mycel_group.command(name="spells", description="List available steps")
+    async def slash_mycel_spells(interaction: discord.Interaction) -> None:
+        await interaction.response.send_message(bot_instance.orchestrator.list_spells())
 
-    @arcane_group.command(name="reload", description="Recharger la configuration")
-    async def slash_crew_reload(interaction: discord.Interaction) -> None:
-        result = bot_instance.arcane.reload_config()
+    @mycel_group.command(name="metrics", description="Execution metrics")
+    async def slash_mycel_metrics(interaction: discord.Interaction) -> None:
+        await interaction.response.send_message(bot_instance.orchestrator.get_metrics())
+
+    @mycel_group.command(name="reset-metrics", description="Zero all metric counters (state + skill_metrics + run_number)")
+    async def slash_mycel_reset_metrics(interaction: discord.Interaction) -> None:
+        bot_instance.orchestrator.reset_all_metrics()
+        bot_instance._forge_threads.clear()
+        await interaction.response.send_message(
+            "\U0001f4ca **Mycel** → All metrics counters zeroed (state + skill_metrics + run_number)."
+        )
+
+    @mycel_group.command(name="mcp", description="Check MCP server health")
+    async def slash_mycel_mcp(interaction: discord.Interaction) -> None:
+        await interaction.response.defer(thinking=True)
+        status = await bot_instance.orchestrator.get_mcp_status()
+        chunks = chunk_message(status)
+        await interaction.followup.send(chunks[0])
+        for chunk in chunks[1:]:
+            await interaction.followup.send(chunk)
+
+    @mycel_group.command(name="reload", description="Reload configuration from disk")
+    async def slash_mycel_reload(interaction: discord.Interaction) -> None:
+        result = bot_instance.orchestrator.reload_config()
         await interaction.response.send_message(f"\U0001f504 {result}")
 
-    tree.add_command(arcane_group)
+    tree.add_command(mycel_group)
 
 
-bot = ArcaneBot()
+bot = MycelBot()
 
 
 # ------------------------------------------------------------------
-# !crew commands (global)
+# !mycel commands (global)  — !dispatch is registered as an alias below
 # ------------------------------------------------------------------
 
-@bot.command(name="arcane")
-async def cmd_crew(ctx: commands.Context, subcommand: str = "status", *, args: str = "") -> None:  # type: ignore[type-arg]
+async def _handle_mycel_subcommand(ctx: commands.Context, subcommand: str, args: str) -> None:
     sub = subcommand.lower()
 
     if sub == "status":
-        await bot._send_to_channel(bot.arcane.get_global_status())
-    elif sub == "forges":
-        await bot._send_to_channel(bot.arcane.list_circles())
-    elif sub == "skills":
-        await bot._send_to_channel(bot.arcane.list_spells())
+        await bot._send_to_channel(await bot.orchestrator.get_global_status())
+    elif sub in ("forges", "forge", "workflow", "workflows", "circles"):
+        await bot._send_to_channel(bot.orchestrator.list_forges())
+    elif sub in ("spells", "spell", "skill", "skills", "steps", "step"):
+        await bot._send_to_channel(bot.orchestrator.list_spells())
     elif sub == "metrics":
-        await bot._send_to_channel(bot.arcane.get_metrics())
+        await bot._send_to_channel(bot.orchestrator.get_metrics())
     elif sub == "reload":
-        result = bot.arcane.reload_config()
-        await ctx.send(f"\U0001f504 **Arcane** \u2192 {result}")
+        result = bot.orchestrator.reload_config()
+        await ctx.send(f"\U0001f504 **Mycel** → {result}")
     elif sub == "reset":
-        bot.arcane.reset_all()
-        await ctx.send("\U0001f9e0 **Arcane** \u2192 Toutes les forges ont ete reinitialisees.")
+        if args.strip().lower() == "metrics":
+            bot.orchestrator.reset_all_metrics()
+            bot._forge_threads.clear()
+            await ctx.send("\U0001f4ca **Mycel** → All metrics counters zeroed (state + skill_metrics + run_number).")
+        else:
+            bot.orchestrator.reset_all()
+            await ctx.send("\U0001f344 **Mycel** → All forges have been reset.")
+    elif sub == "mcp":
+        status = await bot.orchestrator.get_mcp_status()
+        await bot._send_to_channel(status)
     elif sub == "sentry":
         action = args.strip().lower() if args.strip() else "status"
         if action == "check":
-            await ctx.send("\U0001f441 **Sentry** \u2192 Verification manuelle en cours...")
-            count = await bot.arcane.run_sentry_check()
+            await ctx.send("\U0001f441 **Sentry** → Manual check running...")
+            count = await bot.orchestrator.run_sentry_check()
             if count == 0:
-                await ctx.send("\U0001f441 **Sentry** \u2192 Aucune nouvelle erreur")
+                await ctx.send("\U0001f441 **Sentry** → No new issues")
         elif action == "start":
-            await bot.arcane.start_sentry_monitor()
-            await ctx.send("\U0001f441 **Sentry Monitor** \u2192 Demarre")
+            await bot.orchestrator.start_sentry_monitor()
+            await ctx.send("\U0001f441 **Sentry Monitor** → Started")
         elif action == "stop":
-            await bot.arcane.stop_sentry_monitor()
-            await ctx.send("\U0001f441 **Sentry Monitor** \u2192 Arrete")
+            await bot.orchestrator.stop_sentry_monitor()
+            await ctx.send("\U0001f441 **Sentry Monitor** → Stopped")
         elif action == "status":
-            if bot.arcane.sentry_monitor:
-                await ctx.send(bot.arcane.sentry_monitor.status)
+            if bot.orchestrator.sentry_monitor:
+                await ctx.send(bot.orchestrator.sentry_monitor.status)
             else:
-                await ctx.send("\U0001f441 **Sentry Monitor** \u2014 non configure (sentry_monitor.enabled: false)")
+                await ctx.send("\U0001f441 **Sentry Monitor** — not configured (sentry_monitor.enabled: false)")
         else:
-            await ctx.send("Usage : `!crew sentry [check|start|stop|status]`")
+            await ctx.send("Usage: `!mycel sentry [check|start|stop|status]`")
+    elif sub == "aikido":
+        action = args.strip().lower() if args.strip() else "status"
+        if action == "check":
+            await ctx.send("\U0001f6e1 **Aikido** → Manual check running...")
+            count = await bot.orchestrator.run_aikido_check()
+            if count == 0:
+                await ctx.send("\U0001f6e1 **Aikido** → No new issues")
+        elif action == "start":
+            await bot.orchestrator.start_aikido_monitor()
+            await ctx.send("\U0001f6e1 **Aikido Monitor** → Started")
+        elif action == "stop":
+            await bot.orchestrator.stop_aikido_monitor()
+            await ctx.send("\U0001f6e1 **Aikido Monitor** → Stopped")
+        elif action == "status":
+            if bot.orchestrator.aikido_monitor:
+                await ctx.send(bot.orchestrator.aikido_monitor.status)
+            else:
+                await ctx.send("\U0001f6e1 **Aikido Monitor** — not configured (aikido_monitor.enabled: false)")
+        else:
+            await ctx.send("Usage: `!mycel aikido [check|start|stop|status]`")
     else:
-        await ctx.send(f"Sous-commande inconnue : `{sub}`. Utilisez `status`, `forges`, `skills` ou `reset`.")
+        await ctx.send(
+            f"Unknown subcommand: `{sub}`. Use `status`, `forges`, `steps`, `mcp`, `metrics`, `reload`, or `reset`."
+        )
+
+
+@bot.command(name="mycel")
+async def cmd_mycel(ctx: commands.Context, subcommand: str = "status", *, args: str = "") -> None:  # type: ignore[type-arg]
+    await _handle_mycel_subcommand(ctx, subcommand, args)
+
+
+@bot.command(name="dispatch")
+async def cmd_dispatch_alias(ctx: commands.Context, subcommand: str = "status", *, args: str = "") -> None:  # type: ignore[type-arg]
+    """Backwards-compat alias for !mycel."""
+    await _handle_mycel_subcommand(ctx, subcommand, args)
 
 
 @bot.event
@@ -748,8 +1071,8 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError) 
     # Ignore command-not-found since forge commands are handled in on_message
     if isinstance(error, commands.CommandNotFound):
         return
-    logger.error("Erreur commande: %s", error, exc_info=error)
-    await ctx.send(f"\u274c Erreur : {error}")
+    logger.error("Command error: %s", error, exc_info=error)
+    await ctx.send(f"❌ Error: {error}")
 
 
 # ------------------------------------------------------------------
@@ -764,10 +1087,10 @@ def main() -> None:
     )
 
     if not DISCORD_TOKEN or DISCORD_TOKEN == "xxx":
-        logger.error("Configurez DISCORD_BOT_TOKEN dans .env")
+        logger.error("Set DISCORD_BOT_TOKEN in .env")
         return
 
-    logger.info("Demarrage du bot Arcane")
+    logger.info("Starting Mycel bot")
     bot.run(DISCORD_TOKEN)
 
 

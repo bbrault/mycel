@@ -6,7 +6,7 @@ import os
 import shutil
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Union
 
-logger = logging.getLogger("arcane.familiar")
+logger = logging.getLogger("mycel.familiar")
 
 StreamCallback = Callable[[str], Coroutine[Any, Any, None]]
 
@@ -94,15 +94,38 @@ async def _run_streaming(
         data = await proc.stderr.read()
         stderr_chunks.append(data)
 
+    stdout_task = asyncio.create_task(_read_stdout())
+    stderr_task = asyncio.create_task(_read_stderr())
+    reader_tasks = (stdout_task, stderr_task)
+
+    async def _drain_readers() -> None:
+        for t in reader_tasks:
+            if not t.done():
+                t.cancel()
+        # return_exceptions=True so CancelledError from the readers is retrieved
+        # and asyncio doesn't log "exception was never retrieved".
+        await asyncio.gather(*reader_tasks, return_exceptions=True)
+
     try:
-        await asyncio.wait_for(
-            asyncio.gather(_read_stdout(), _read_stderr()),
-            timeout=timeout,
-        )
-    except asyncio.TimeoutError:
+        done, pending = await asyncio.wait(reader_tasks, timeout=timeout)
+    except asyncio.CancelledError:
         proc.kill()
         await proc.wait()
+        await _drain_readers()
+        raise
+
+    if pending:
+        proc.kill()
+        await proc.wait()
+        await _drain_readers()
         return None
+
+    # Surface any unexpected reader exception (other than cancellation).
+    for t in done:
+        exc = t.exception()
+        if exc is not None and not isinstance(exc, asyncio.CancelledError):
+            await proc.wait()
+            raise exc
 
     await proc.wait()
     stderr_full = b"".join(stderr_chunks).decode("utf-8", errors="replace")
@@ -145,7 +168,7 @@ class ClaudeRunner:
     def _build_args(self) -> List[str]:
         """Build the CLI arguments list."""
         args = [self._claude_path, "-p"]
-        if self._allowed_tools:
+        if self._allowed_tools is not None:
             args.extend(["--allowedTools", self._allowed_tools])
         if self._mcp_config:
             args.extend(["--mcp-config", self._mcp_config])
@@ -203,6 +226,10 @@ class ClaudeRunner:
             await proc.wait()
             logger.warning("Claude runner timeout apres %ds", effective_timeout)
             return RunnerResult(stdout="", stderr=f"Claude runner timed out after {effective_timeout}s", returncode=-1, runner_used=self.name)
+        except asyncio.CancelledError:
+            proc.kill()
+            await proc.wait()
+            raise
 
         logger.info("Claude runner termine (code=%s)", proc.returncode)
         return RunnerResult(
@@ -286,6 +313,10 @@ class GeminiRunner:
             result = await self._fallback.run(prompt, timeout=timeout, cwd=cwd)
             result.runner_used = "claude (fallback after gemini timeout)"
             return result
+        except asyncio.CancelledError:
+            proc.kill()
+            await proc.wait()
+            raise
 
         if proc.returncode != 0:
             logger.warning("Gemini erreur (code=%s), fallback sur Claude", proc.returncode)
@@ -385,6 +416,10 @@ class CursorRunner:
             result = await self._fallback.run(prompt, timeout=timeout, cwd=cwd)
             result.runner_used = "claude (fallback after cursor timeout)"
             return result
+        except asyncio.CancelledError:
+            proc.kill()
+            await proc.wait()
+            raise
 
         if proc.returncode != 0:
             logger.warning("Cursor erreur (code=%s), fallback sur Claude", proc.returncode)

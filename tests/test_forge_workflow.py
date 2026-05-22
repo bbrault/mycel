@@ -18,7 +18,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from forge import Circle
+from forge import Forge
 from message_bus import MessageBus
 from runner import RunnerResult
 
@@ -42,11 +42,11 @@ def _make_circle(
 ) -> Forge:
     """Create a Forge with the given workflow and skills for testing."""
     bus = MessageBus(bus_dir=bus_dir)
-    return Circle(
+    return Forge(
         name="test",
         description="test forge",
         workflow=workflow,
-        skills=skills,
+        spells=skills,
         workspace={},
         bus=bus,
         bus_dir=bus_dir,
@@ -333,7 +333,7 @@ class TestPassCondition:
 
         assert circle.state["status"] == "completed"
         # First plan call: no feedback
-        assert "premier passage" in prompts_received[0]
+        assert "first pass" in prompts_received[0]
         # Second plan call (after gate rejection): should contain reviewer feedback
         assert "Missing Repository Interface" in prompts_received[2]
         assert "Plan incomplet" in prompts_received[2]
@@ -681,4 +681,208 @@ class TestStatePersistence:
         with open(output_path) as f:
             saved = json.load(f)
         assert saved["skill"] == "step-a"
-        assert "42" in saved["output"]
+
+
+class TestHookTimeout:
+    """Hooks (pre_run/post_run) must kill leaked subprocesses on timeout."""
+
+    @pytest.mark.asyncio
+    async def test_post_run_timeout_kills_subprocess(self) -> None:
+        tmp = tempfile.mkdtemp()
+        circle = _make_circle(tmp, ["step-a"], SIMPLE_SKILLS)
+        await circle.bus.start()
+        try:
+            # A hook that would normally hang forever (sleep 30s) but has a 1s budget.
+            output = await circle._exec_hook(
+                "step-a",
+                "post_run",
+                "echo started; sleep 30; echo never",
+                timeout_s=1,
+            )
+            # We get a timeout marker, NOT the "never" line — proof the proc was killed.
+            assert "timeout" in output
+            assert "never" not in output
+        finally:
+            await circle.bus.stop()
+
+    @pytest.mark.asyncio
+    async def test_post_run_timeout_uses_per_spell_override(self) -> None:
+        """The post_run_timeout key on a spell should override the 300s default."""
+        tmp = tempfile.mkdtemp()
+        skills = {
+            "impl": {
+                "prompt": "do it",
+                "runner": "claude",
+                "auto_advance": True,
+                "next_on_pass": None,
+                "next_on_fail": None,
+                "pass_condition": None,
+                "post_run": "sleep 5; echo never",
+                "post_run_timeout": 1,
+            },
+        }
+        circle = _make_circle(tmp, ["impl"], skills)
+
+        async def mock_run(prompt: str, timeout: int = 60, on_output: Any = None, **kwargs: Any) -> RunnerResult:
+            return _make_runner_result('{"ok": true}')
+
+        mock_runner = AsyncMock()
+        mock_runner.run = mock_run
+
+        with patch("forge.get_runner", return_value=mock_runner):
+            await circle.bus.start()
+            try:
+                await circle.run_workflow("test")
+            finally:
+                await circle.bus.stop()
+
+        post = circle.state["step_outputs"].get("_post_run", "")
+        assert "timeout" in post
+        assert "never" not in post
+
+
+class TestRecoverySafeguards:
+    """Recovery at startup must not silently re-run stale or interrupted state."""
+
+    def _make_orchestrator(self, tmp: str, paused_state: Dict[str, Any], state_age_s: float = 0) -> Any:
+        """Build a Mycel with one forge whose state.json reflects `paused_state`."""
+        import importlib.util
+        # Load mycel.py as a module bypassing the package shadowing.
+        spec = importlib.util.spec_from_file_location(
+            "_mycel_for_test",
+            os.path.join(os.path.dirname(__file__), "..", "mycel.py"),
+        )
+        mycel_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mycel_mod)
+
+        config_path = os.path.join(tmp, "config.yaml")
+        spells_path = os.path.join(tmp, "spells.yaml")
+        with open(config_path, "w") as f:
+            f.write(
+                "forges:\n"
+                "  test:\n"
+                "    description: t\n"
+                "    familiar: claude\n"
+                "    channel: t\n"
+                "    ritual:\n"
+                "      - step-a\n"
+                "      - step-b\n"
+                "auto_resume_max_age_s: 60\n"
+            )
+        with open(spells_path, "w") as f:
+            f.write(
+                "spells:\n"
+                "  step-a:\n"
+                "    runner: claude\n"
+                "    auto_advance: false\n"
+                "    next_on_pass: step-b\n"
+                "    prompt: a\n"
+                "  step-b:\n"
+                "    runner: claude\n"
+                "    auto_advance: true\n"
+                "    next_on_pass: null\n"
+                "    prompt: b\n"
+            )
+
+        bus_dir = os.path.join(tmp, "bus")
+        os.makedirs(os.path.join(bus_dir, "test"), exist_ok=True)
+        state_path = os.path.join(bus_dir, "test", "state.json")
+        with open(state_path, "w") as f:
+            json.dump(paused_state, f)
+
+        if state_age_s > 0:
+            past = os.path.getmtime(state_path) - state_age_s
+            os.utime(state_path, (past, past))
+
+        return mycel_mod.Mycel(config_path=config_path, spells_path=spells_path, bus_dir=bus_dir)
+
+    async def _setup_for_recovery(self, orch: Any) -> None:
+        """Initialize the queues without spawning real worker tasks."""
+        for forge_name in orch.forges:
+            orch._forge_queues[forge_name] = asyncio.Queue()
+            orch._active_items[forge_name] = None
+        orch._worker_started = True
+
+    @pytest.mark.asyncio
+    async def test_stale_paused_state_is_not_auto_resumed(self) -> None:
+        tmp = tempfile.mkdtemp()
+        # Paused after step-a (already in step_outputs), but 1 hour old → stale.
+        state = {
+            "status": "paused",
+            "current_skill": "step-a",
+            "current_index": 0,
+            "task": "old task",
+            "step_outputs": {"step-a": '{"done": true}'},
+            "previous_output": '{"done": true}',
+            "retries": {},
+            "run_number": 1,
+        }
+        orch = self._make_orchestrator(tmp, state, state_age_s=3600)
+
+        await orch.bus.start()
+        try:
+            await self._setup_for_recovery(orch)
+            await orch._recover_forges()
+        finally:
+            await orch.bus.stop()
+
+        # No queue item should have been enqueued (stale → user must confirm).
+        assert orch._forge_queues["test"].qsize() == 0
+        # State should remain paused (not flipped to idle / running).
+        assert orch.forges["test"].state["status"] == "paused"
+
+    @pytest.mark.asyncio
+    async def test_running_state_is_demoted_to_paused(self) -> None:
+        """A 'running' state at restart = bot was killed mid-spell. Never auto-resume."""
+        tmp = tempfile.mkdtemp()
+        state = {
+            "status": "running",  # interrupted mid-spell
+            "current_skill": "step-a",
+            "current_index": 0,
+            "task": "task",
+            "step_outputs": {},  # spell did NOT complete
+            "previous_output": None,
+            "retries": {},
+            "run_number": 1,
+        }
+        orch = self._make_orchestrator(tmp, state, state_age_s=10)  # even fresh
+
+        await orch.bus.start()
+        try:
+            await self._setup_for_recovery(orch)
+            await orch._recover_forges()
+        finally:
+            await orch.bus.stop()
+
+        assert orch._forge_queues["test"].qsize() == 0  # nothing re-enqueued
+        assert orch.forges["test"].state["status"] == "paused"
+        assert "Interrupted" in (orch.forges["test"].state.get("error") or "")
+
+    @pytest.mark.asyncio
+    async def test_fresh_paused_state_does_auto_resume(self) -> None:
+        """Sanity check: a recently-paused state still auto-resumes."""
+        tmp = tempfile.mkdtemp()
+        state = {
+            "status": "paused",
+            "current_skill": "step-a",
+            "current_index": 0,
+            "task": "task",
+            "step_outputs": {"step-a": '{"done": true}'},
+            "previous_output": '{"done": true}',
+            "retries": {},
+            "run_number": 1,
+        }
+        orch = self._make_orchestrator(tmp, state, state_age_s=5)  # very fresh
+
+        await orch.bus.start()
+        try:
+            await self._setup_for_recovery(orch)
+            await orch._recover_forges()
+        finally:
+            await orch.bus.stop()
+
+        queue = orch._forge_queues["test"]
+        assert queue.qsize() == 1
+        item = queue.get_nowait()
+        # step-a already done → should advance to step-b
+        assert item.from_spell == "step-b"

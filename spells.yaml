@@ -7,7 +7,7 @@ spells:
   elaborate:
     command: /elaborate
     runner: claude
-    description: "Specifications fonctionnelles (Product Manager)"
+    description: "Functional specifications (Product Manager)"
     auto_advance: true
     next_on_pass: plan
     next_on_fail: null
@@ -88,7 +88,7 @@ spells:
   plan:
     command: /plan
     runner: claude
-    description: "Planification technique (Lead Developer)"
+    description: "Technical planning (Lead Developer)"
     auto_advance: true
     next_on_pass: arch-review
     next_on_fail: null
@@ -191,11 +191,11 @@ spells:
   arch-review:
     command: /arch-review
     runner: gemini
-    description: "Review architecturale (Architect — modele independant)"
+    description: "Architecture review (Architect — independent model)"
     auto_advance: false
     next_on_pass: implement
     next_on_fail: plan
-    pass_condition: "verdict == 'approved'"
+    pass_condition: "(verdict == 'approved' or verdict == 'approved_with_reservations') and score >= 80"
     required_fields: [verdict, score, summary]
     timeout: 900
     runner_kwargs:
@@ -207,8 +207,8 @@ spells:
       **Tache JIRA** : {jira_id}
       **Workspace** : {workspace}
 
-      **Specifications fonctionnelles** :
-      {step_output_elaborate}
+      **Specifications fonctionnelles (resume)** :
+      {step_summary_elaborate}
 
       **Plan technique a valider** :
       {previous_output}
@@ -263,12 +263,13 @@ spells:
   implement:
     command: /implement
     runner: claude
-    description: "Implementation par phase (Fullstack Developer)"
+    description: "Phased implementation (Fullstack Developer)"
     auto_advance: false
     next_on_pass: tech-review
     next_on_fail: null
     pass_condition: null
     post_run: "cd {workspace_first} && (composer test --no-interaction 2>&1 || true) | tail -80; echo '---'; (npx vitest run --reporter=verbose 2>&1 || true) | tail -80"
+    post_run_timeout: 900
     timeout: 1800
     git_prepare: true
     prompt: |
@@ -286,20 +287,17 @@ spells:
       **Documentation issue (fichiers locaux)** :
       {issue_context}
 
-      **Specifications fonctionnelles** :
-      {step_output_elaborate}
+      **Specifications fonctionnelles (resume)** :
+      {step_summary_elaborate}
 
       **Plan technique** :
       {step_output_plan}
 
-      **Review architecturale** :
-      {step_output_arch-review}
+      **Review architecturale (resume)** :
+      {step_summary_arch-review}
 
       **Instructions additionnelles** :
       {instructions}
-
-      **Contexte precedent** :
-      {previous_output}
 
       **Feedback du reviewer technique (si rejet precedent)** :
       {reviewer_feedback}
@@ -369,11 +367,11 @@ spells:
   tech-review:
     command: /tech-review
     runner: cursor
-    description: "Review technique code (Lead Dev — outil Cursor)"
+    description: "Technical code review (Lead Dev — Cursor tool)"
     auto_advance: false
     next_on_pass: qa-scenario
     next_on_fail: implement
-    pass_condition: "verdict == 'approved'"
+    pass_condition: "(verdict == 'approved' or verdict == 'approved_with_reservations') and score >= 80"
     required_fields: [verdict, score, summary]
     git_finalize: true
     timeout: 900
@@ -457,7 +455,7 @@ spells:
   qa-scenario:
     command: /qa-scenario
     runner: claude
-    description: "Scenarios de test E2E (QA Designer)"
+    description: "E2E test scenarios (QA Designer)"
     auto_advance: false
     next_on_pass: null
     next_on_fail: null
@@ -472,17 +470,17 @@ spells:
       **Tache JIRA** : {jira_id}
       **Workspace** : {workspace}
 
-      **Specifications fonctionnelles** :
-      {step_output_elaborate}
+      **Specifications fonctionnelles (resume)** :
+      {step_summary_elaborate}
 
       **Plan technique** :
       {step_output_plan}
 
-      **Code implemente** :
-      {step_output_implement}
+      **Code implemente (resume)** :
+      {step_summary_implement}
 
-      **Review technique** :
-      {step_output_tech-review}
+      **Review technique (resume)** :
+      {step_summary_tech-review}
 
       **Instructions additionnelles** :
       {instructions}
@@ -529,10 +527,94 @@ spells:
   # Skills complementaires
   # ==================================================================
 
+  fix:
+    command: /fix
+    runner: claude
+    description: "Bug analysis + fix plan (Lead Developer)"
+    auto_advance: true
+    next_on_pass: implement
+    next_on_fail: null
+    pass_condition: null
+    timeout: 900
+    # Sourced from the Claude Code skill definition. `$ARGUMENTS` is
+    # auto-rewritten to `{task}` + `{instructions}` by the spell loader.
+    prompt_file: ~/.workspace-manager/kanta-ai-docs/framework/skills/fix/SKILL.md
+
+  # ==================================================================
+  # Phase 0 (sentry/aikido) — Create the tracking JIRA ticket
+  # ==================================================================
+
+  jira-create:
+    command: /jira-create
+    runner: claude
+    description: "Create a JIRA ticket referencing the Sentry/Aikido issue"
+    auto_advance: true
+    next_on_pass: fix
+    next_on_fail: null
+    pass_condition: null
+    required_fields: [jira_id, summary]
+    timeout: 300
+    runner_kwargs:
+      allowed_tools: "mcp__claude_ai_Atlassian__*,mcp__claude_ai_Sentry__*,mcp__claude_ai_Aikido__*"
+    prompt: |
+      Tu utilises les MCP Atlassian/JIRA, Sentry et Aikido pour creer un ticket JIRA
+      qui trace l'incident recu et sert de reference pour la suite du workflow
+      (commits, MR, communication equipe).
+
+      **Forge** : {forge_name}
+      **Workspace** : {workspace}
+
+      **Incident a tracer** :
+      {task}
+
+      **Instructions additionnelles** :
+      {instructions}
+
+      ## Ta mission
+
+      1. **Idempotence** : si le titre / la description contient deja un identifiant
+         JIRA existant (ex: `KAN-1234`), NE CREE PAS de doublon — recupere le ticket
+         existant via `mcp__claude_ai_Atlassian__getJiraIssue` et renvoie ses infos
+         avec `created: false`.
+      2. **Contexte** : enrichis le ticket en allant chercher le detail de l'incident :
+         - Sentry → `mcp__claude_ai_Sentry__search_issues` puis `get_sentry_resource`
+           pour la stacktrace, frequence, premiere/derniere occurrence, environnement.
+         - Aikido → `mcp__claude_ai_Aikido__*` pour les findings de securite.
+      3. **Creation** : appelle `mcp__claude_ai_Atlassian__createJiraIssue` dans le
+         projet JIRA Kanta (par defaut `KAN`, sauf override en instructions) avec :
+         - **Issue Type** : Bug
+         - **Summary** : titre concis du probleme (≤ 120 caracteres)
+         - **Description** : structure markdown avec
+           - Lien direct vers la source (Sentry / Aikido)
+           - Message d'erreur + stacktrace tronquee (≤ 50 lignes)
+           - Frequence, environnements impactes, premiere occurrence
+           - Section "References" avec l'ID source brut
+         - **Priority** : derive de la severite — fatal/critical → Highest, error/high → High, warning/medium → Medium, info/low → Low
+         - **Labels** : `sentry` ou `aikido` selon la source, plus `auto-created`
+
+      ## IMPORTANT
+      - Si la creation JIRA echoue (auth, projet introuvable, etc.), renvoie
+        `created: false` avec l'erreur dans `summary` — ne bloque PAS la suite
+        du ritual : la forge continue avec le contexte source initial.
+      - Le `jira_id` retourne sera utilise par les spells suivants (`fix`,
+        `implement`, `tech-review`) pour les commits au format `[KAN-XXX]`.
+
+      Reponds UNIQUEMENT en JSON valide :
+      {{
+        "jira_id": "KAN-XXX",
+        "jira_url": "https://...atlassian.net/browse/KAN-XXX",
+        "source": "sentry|aikido",
+        "source_id": "...",
+        "source_url": "...",
+        "priority": "Highest|High|Medium|Low",
+        "created": true,
+        "summary": "Resume du ticket cree (ou de l'erreur si created=false)"
+      }}
+
   diagnose:
     command: /diagnose
     runner: claude
-    description: "Diagnostic de bug (4 etapes)"
+    description: "Bug diagnosis (4 steps)"
     auto_advance: true
     next_on_pass: plan
     next_on_fail: null
@@ -592,7 +674,7 @@ spells:
   audit:
     command: /audit
     runner: gemini
-    description: "Audit securite + dependances (OWASP, CVE, secrets)"
+    description: "Security and dependency audit (OWASP, CVE, secrets)"
     auto_advance: false
     next_on_pass: plan
     next_on_fail: null
@@ -678,7 +760,7 @@ spells:
   research:
     command: /research
     runner: claude
-    description: "Recherche de nouvelles features Kanta (Notion + JIRA + repo)"
+    description: "Feature discovery from Notion + JIRA + repo"
     auto_advance: false
     next_on_pass: elaborate
     next_on_fail: null
@@ -766,6 +848,147 @@ spells:
         "summary": "Resume 2-3 phrases"
       }}
 
+  claap-discovery:
+    command: /claap-discovery
+    runner: claude
+    description: "Feature discovery from a Claap recording (transcript + codebase + ROI)"
+    auto_advance: false
+    next_on_pass: elaborate
+    next_on_fail: null
+    pass_condition: null
+    timeout: 1200
+    runner_kwargs:
+      allowed_tools: "mcp__claude_ai_Claap__*,mcp__claude_ai_Notion__*,mcp__claude_ai_Atlassian__*,mcp__claude_ai_Slack__*,WebSearch,WebFetch,Read,Grep,Glob,Bash"
+    prompt: |
+      Tu es un **Product Manager senior** chez Kanta (SaaS de conformite RGPD / questionnaires
+      fournisseurs). Tu pars d'un enregistrement Claap (interview client, demo, retro, daily
+      produit...) et tu en extrais des opportunites produit ancrees dans le verbatim, puis
+      tu les confrontes a la codebase Kanta et — si utile — au marche, pour proposer des
+      features priorisees avec une estimation de ROI.
+
+      **Forge** : {forge_name}
+      **Workspace** : {workspace}
+
+      **URL Claap (ou identifiant de recording)** :
+      {task}
+
+      **Instructions additionnelles** :
+      {instructions}
+
+      **Contexte precedent** :
+      {previous_output}
+
+      ## Etapes obligatoires
+
+      1. **Recuperer la transcription**
+         - Si `{task}` est une URL Claap, extrais l'identifiant et appelle
+           `mcp__claude_ai_Claap__get_recording_transcript`.
+         - Sinon, utilise `mcp__claude_ai_Claap__search_recording_transcripts` avec un
+           mot-cle tire de `{instructions}`, ou liste les recordings via
+           `mcp__claude_ai_Claap__get_recordings`.
+         - Note les locuteurs, l'horodatage des moments-cles, le contexte (qui parle, role).
+
+      2. **Detecter pain points & demandes de feature**
+         - Pain points : friction, contournement, frustration, churn-risk, regression vecue.
+         - Feature requests : besoin explicite ("j'aimerais", "ce serait bien si"), manque
+           cite, comparaison concurrent.
+         - Pour chaque element, cite le verbatim (timestamp + extrait) — pas de paraphrase
+           sans source.
+
+      3. **Analyser la codebase Kanta**
+         - Stack : Laravel 11 / PHP 8.3 (api), Nuxt 3 / Vue 3 / TS (front), kanta-ui.
+         - Inspecte `{workspace}` (Read / Grep / Glob) pour determiner ce qui existe deja,
+           ce qui manque, et les zones a faible cout d'ajout.
+         - Pour chaque pain point / feature, indique : "deja partiellement couvert par X" /
+           "necessite un nouveau module Y" / "extension du repository Z".
+
+      4. **Recherche web (optionnelle, si valeur ajoutee)**
+         - Si un pain point cite un competiteur, une norme RGPD recente, un standard
+           (NIS2, DORA, ISO 27001 evolutions...) ou une attente marche, utilise `WebSearch`
+           pour confirmer ou completer.
+         - Limite : max 3 recherches, chacune ciblee. Cite l'URL.
+
+      5. **Proposer 3 a 5 features priorisees**
+         - Chaque feature s'appuie sur >= 1 verbatim Claap ET tient compte de la codebase
+           existante.
+
+      6. **Estimer un ROI (best effort)**
+         - Si la donnee manque : `roi_score: null` et explique dans `assumptions` ce qu'il
+           faudrait pour chiffrer (ex : "besoin du nb de DPO impactes", "besoin du taux
+           de churn lie").
+         - Sinon : `value_score` (1-10), `effort_weeks` (estimation dev),
+           `roi_score = value_score / max(effort_weeks, 0.5)`,
+           `confidence` (low|medium|high).
+
+      ## IMPORTANT
+      - Ancre TOUT dans le verbatim Claap. Pas de feature "hors-sol".
+      - Reste Product Manager : pas de plongee technique profonde, mais signale les zones
+        codebase pertinentes pour le Lead Dev.
+      - Si la transcription est inaccessible ou trop pauvre, dis-le explicitement et
+        sors un JSON avec `feature_ideas: []` + `error` rempli — ne fabrique rien.
+      - La prochaine etape sera `!discovery resume <choix>` pour elaborer l'idee retenue.
+
+      Reponds UNIQUEMENT en JSON valide :
+      {{
+        "claap_source": {{
+          "url_or_id": "{task}",
+          "title": "...",
+          "participants": ["..."],
+          "duration_min": null,
+          "recorded_at": "..."
+        }},
+        "pain_points": [
+          {{
+            "id": "PP-1",
+            "summary": "...",
+            "verbatim": "extrait court",
+            "timestamp": "mm:ss",
+            "speaker": "...",
+            "severity": "high|medium|low"
+          }}
+        ],
+        "feature_requests_explicit": [
+          {{"id": "FR-1", "summary": "...", "verbatim": "...", "timestamp": "mm:ss"}}
+        ],
+        "codebase_observations": [
+          {{"area": "kanta-api-v2/...", "status": "existing|missing|partial", "notes": "..."}}
+        ],
+        "web_research": [
+          {{"query": "...", "url": "...", "insight": "..."}}
+        ],
+        "feature_ideas": [
+          {{
+            "id": "IDEA-1",
+            "name": "...",
+            "problem": "...",
+            "solution": "...",
+            "target_users": ["..."],
+            "value": "...",
+            "effort": "low|medium|high",
+            "priority": "high|medium|low",
+            "sources": {{
+              "claap": ["PP-1", "FR-2"],
+              "codebase": ["..."],
+              "web": ["..."]
+            }},
+            "roi": {{
+              "value_score": null,
+              "effort_weeks": null,
+              "roi_score": null,
+              "confidence": "low|medium|high",
+              "assumptions": ["..."]
+            }}
+          }}
+        ],
+        "top_pick": {{
+          "idea_id": "IDEA-X",
+          "rationale": "Pourquoi celle-ci en premier (incluant le ROI)"
+        }},
+        "open_questions": ["..."],
+        "summary": "Resume 2-3 phrases",
+        "error": null
+      }}
+
   # ==================================================================
   # Review de Merge Request — workflow multi-agents
   # ==================================================================
@@ -773,16 +996,17 @@ spells:
   mr-fetch:
     command: /mr-fetch
     runner: claude
-    description: "Recuperation du diff et des metadonnees d'une MR GitLab"
+    description: "Fetch MR diff and metadata (GitLab)"
     auto_advance: true
     next_on_pass: mr-review
     next_on_fail: null
     pass_condition: null
     required_fields: [project, iid, title, diff, summary]
-    timeout: 300
+    timeout: 600
     runner_kwargs:
-      allowed_tools: null
+      allowed_tools: ""
     pre_run: "glab mr view {mr_iid} --repo {mr_project} --comments=false 2>/dev/null; echo '---DIFF_SEPARATOR---'; glab mr diff {mr_iid} --repo {mr_project} 2>/dev/null"
+    pre_run_timeout: 180
     prompt: |
       Tu es un **assistant technique**. Formate les donnees d'une Merge Request GitLab en JSON structure.
 
@@ -831,10 +1055,25 @@ spells:
         "summary": "Resume en 2-3 phrases du contenu de la MR"
       }}
 
+  review-mr:
+    command: /review-mr
+    runner: claude
+    description: "Comprehensive MR review — architecture, patterns, code quality, security, tests (project skill)"
+    auto_advance: true
+    next_on_pass: null
+    next_on_fail: null
+    pass_condition: null
+    timeout: 900
+    runner_kwargs:
+      allowed_tools: null
+    # Sourced from the project Claude Code skill (~/.workspace-manager/...).
+    # `$ARGUMENTS` is auto-rewritten to `{task}` + `{instructions}` by the spell loader.
+    prompt_file: ~/.workspace-manager/kanta-ai-docs/framework/skills/review-mr/SKILL.md
+
   mr-review:
     command: /mr-review
     runner: claude
-    description: "Review code de la MR (bugs, securite, breaking changes, tests)"
+    description: "MR code review (bugs, security, breaking changes, tests)"
     auto_advance: true
     next_on_pass: mr-review-arch
     next_on_fail: null
@@ -946,7 +1185,7 @@ spells:
   mr-review-arch:
     command: /mr-review-arch
     runner: gemini
-    description: "Review architecturale de la MR (modele independant)"
+    description: "MR architecture review (independent model)"
     auto_advance: true
     next_on_pass: mr-review-quality
     next_on_fail: null
@@ -1035,7 +1274,7 @@ spells:
   mr-review-quality:
     command: /mr-review-quality
     runner: cursor
-    description: "Review qualite code de la MR (outil Cursor)"
+    description: "MR code quality review (Cursor tool)"
     auto_advance: true
     next_on_pass: mr-summary
     next_on_fail: null
@@ -1153,7 +1392,7 @@ spells:
   mr-summary:
     command: /mr-summary
     runner: claude
-    description: "Consolidation des reviews et publication sur GitLab"
+    description: "Consolidate reviews, optionally post to GitLab"
     auto_advance: false
     next_on_pass: null
     next_on_fail: null
@@ -1163,7 +1402,7 @@ spells:
     runner_kwargs:
       allowed_tools: null
     prompt: |
-      Tu es un **Tech Lead** senior. Tu consolides les reviews d'une Merge Request et publies le resultat sur GitLab.
+      Tu es un **Tech Lead** senior. Tu consolides les reviews d'une Merge Request.
 
       **Forge** : {forge_name}
 
@@ -1182,11 +1421,21 @@ spells:
       **Review qualite (Cursor)** :
       {step_output_mr-review-quality}
 
+      **Review complete Lead Dev + Architect (Claude — /review-mr)** :
+      {step_output_review-mr}
+
       ## Ta mission
 
       1. **Consolide** les 3 reviews en un rapport unifie
       2. **Genere** les release notes
-      3. **Publie** le rapport sur la MR GitLab via `glab`
+      3. **Si demande explicitement** : publie le rapport sur la MR GitLab via `glab`
+
+      ## Publication sur GitLab (OPTIONNELLE)
+
+      **Ne publie sur GitLab QUE si les instructions additionnelles contiennent explicitement "gitlab", "publish", "post" ou "comment".**
+      Si ce n'est pas le cas, genere uniquement le rapport JSON sans executer de commande `glab`. Mets `gitlab_comment_posted` a `false` et les compteurs inline a 0.
+
+      Si la publication est demandee, suis les etapes ci-dessous :
 
       ## Etape 1 : Consolidation
 
@@ -1205,7 +1454,7 @@ spells:
       - **Breaking changes** (si identifies)
       - **Deprecations**
 
-      ## Etape 3 : Publication sur GitLab
+      ## Etape 3 : Publication sur GitLab (seulement si demandee)
 
       ### 3a. Commentaire general (resume de la review)
 
@@ -1236,7 +1485,7 @@ spells:
       [Points forts identifies]
 
       ---
-      *Review generee automatiquement par Crewline (Claude + Gemini + Cursor)*
+      *Review generee automatiquement par Mycel (Claude + Gemini + Cursor)*
       REVIEWEOF
       )"
       ```
@@ -1258,7 +1507,7 @@ spells:
       **Suggestion :** [Suggestion de correction]
 
       ---
-      *Review Crewline*" \
+      *Review Mycel*" \
         -f "position[position_type]=text" \
         -f "position[base_sha]=[base_sha]" \
         -f "position[head_sha]=[head_sha]" \
@@ -1280,7 +1529,6 @@ spells:
       - Le rapport doit quand meme etre genere en JSON
 
       ## IMPORTANT
-      - Le commentaire GitLab doit etre concis et actionnable
       - Chaque finding bloquant doit avoir : fichier, ligne, description, suggestion
       - Le verdict est base sur : au moins 1 finding critique → corrections_required, uniquement medium/low → approved_with_reservations, aucun finding → approved
 
@@ -1309,7 +1557,7 @@ spells:
           "deprecations": ["..."]
         }},
         "strengths": ["..."],
-        "gitlab_comment_posted": true,
+        "gitlab_comment_posted": false,
         "inline_comments_posted": 0,
         "inline_comments_fallback": 0,
         "summary": "Resume global de la review"

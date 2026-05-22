@@ -7,14 +7,17 @@ import json
 import logging
 import operator
 import os
+import shutil
 import re
+import signal
+import subprocess
 import time
-from typing import Any, Callable, Coroutine, Dict, List, Optional
+from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple
 
 from message_bus import Message, MessageBus
 from runner import StreamCallback, get_runner
 
-logger = logging.getLogger("arcane.circle")
+logger = logging.getLogger("mycel.forge")
 
 
 # ------------------------------------------------------------------
@@ -24,7 +27,7 @@ logger = logging.getLogger("arcane.circle")
 def resolve_issue_context(jira_id: str, docs_path: str, workspace: Dict[str, str]) -> str:
     """Search for local issue docs matching a JIRA ID and return their content."""
     if not jira_id:
-        return "(aucun ID JIRA fourni)"
+        return "(no JIRA id provided)"
 
     md_files: List[str] = []
 
@@ -45,8 +48,8 @@ def resolve_issue_context(jira_id: str, docs_path: str, workspace: Dict[str, str
                             md_files.append(os.path.join(match, f))
 
     if not md_files:
-        logger.info("Aucun doc local trouve pour %s", jira_id)
-        return f"(aucune documentation locale trouvee pour {jira_id} — decrivez la tache dans la commande)"
+        logger.info("No local doc found for %s", jira_id)
+        return f"(no local documentation for {jira_id} — describe the task in the command)"
 
     # Deduplicate by filename
     seen: Dict[str, str] = {}
@@ -95,7 +98,7 @@ def resolve_issue_context(jira_id: str, docs_path: str, workspace: Dict[str, str
         parts.append(f"\n### {name}\n\n{content}")
         total_chars += len(content)
 
-    logger.info("Issue %s: %d fichier(s) charge(s) (%d chars)", jira_id, len(sorted_names), total_chars)
+    logger.info("Issue %s: %d file(s) loaded (%d chars)", jira_id, len(sorted_names), total_chars)
     return "\n".join(parts)
 
 # ------------------------------------------------------------------
@@ -221,8 +224,8 @@ def validate_output(output: str, skill: Dict[str, Any]) -> Optional[str]:
 # ------------------------------------------------------------------
 
 
-class Circle:
-    """An execution environment that runs a state-machine of skills."""
+class Forge:
+    """An execution environment that runs a state-machine of spells (a ritual)."""
 
     # Regex for JIRA-like IDs (e.g. LAB-123, KANTA-456)
     _JIRA_RE = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b")
@@ -253,7 +256,7 @@ class Circle:
         name: str,
         description: str,
         workflow: List[str],
-        skills: Dict[str, Dict[str, Any]],
+        spells: Dict[str, Dict[str, Any]],
         workspace: Dict[str, str],
         bus: MessageBus,
         default_runner: str = "claude",
@@ -263,12 +266,16 @@ class Circle:
         docs_path: str = "",
         issues_dir: str = "",
         runner_kwargs: Optional[Dict[str, Any]] = None,
+        use_git_worktree: bool = False,
     ) -> None:
         self.name = name
         self.description = description
         self.workflow = workflow
-        self.skills = skills
+        self.spells = spells
         self.workspace = workspace
+        self._original_workspace: Dict[str, str] = dict(workspace)
+        self.use_git_worktree: bool = use_git_worktree
+        self._worktree_registry: List[Tuple[str, str, str]] = []
         self.docs_path = docs_path
         self.issues_dir = issues_dir
         self.runner_kwargs = runner_kwargs or {}
@@ -281,6 +288,7 @@ class Circle:
         self.state: Dict[str, Any] = {
             "status": "idle",
             "current_skill": None,
+            "current_skill_started_at": None,
             "current_index": 0,
             "task": None,
             "instructions": None,
@@ -289,6 +297,9 @@ class Circle:
             "previous_output": None,
             "error": None,
             "run_number": 0,
+            "last_review": None,
+            "git_snapshot": {},
+            "external_snapshot": {},
         }
 
         # Created lazily in _ensure_resume_event() — Python 3.9 event loop compat
@@ -340,7 +351,13 @@ class Circle:
             with open(self._state_path, "r", encoding="utf-8") as fh:
                 loaded = json.load(fh)
             # Merge with defaults for keys added in newer versions
-            for key, default in [("run_number", 0)]:
+            for key, default in [
+                ("run_number", 0),
+                ("current_skill_started_at", None),
+                ("last_review", None),
+                ("git_snapshot", {}),
+                ("external_snapshot", {}),
+            ]:
                 loaded.setdefault(key, default)
             self.state = loaded
 
@@ -366,23 +383,68 @@ class Circle:
         with open(archive_path, "w", encoding="utf-8") as fh:
             json.dump(self.state, fh, ensure_ascii=False, indent=2)
 
+    def _jira_folder_name(self) -> Optional[str]:
+        """Return `<jira_id>-<title-slug>` for the current task, or just `<jira_id>` if no title.
+
+        Reused for both the AIDD issue dir and the git worktree path so folder
+        names stay consistent across the run. Prefers the actual checked-out
+        branch name (e.g. `feature/LAB-1918-cleanup-param-pays` → `LAB-1918-cleanup-param-pays`)
+        when one of the workspace repos is on a `<jira_id>-…` branch; falls back to
+        slugging the user-supplied task text.
+        """
+        task_str = self.state.get("task") or ""
+        jira_match = self._JIRA_RE.search(task_str)
+        if not jira_match:
+            return None
+        jira_id = jira_match.group(1)
+
+        branch_slug = self._branch_folder_from_git(jira_id)
+        if branch_slug:
+            return branch_slug
+
+        # Title = text after the JIRA ID, then text before (do NOT fall back to the
+        # full task: that produces a redundant `LAB-1918-lab-1918` slug).
+        title_part = task_str[jira_match.end():].strip()
+        if not title_part:
+            title_part = task_str[:jira_match.start()].strip()
+        slug = re.sub(r"[^a-zA-Z0-9]+", "-", title_part).strip("-").lower()[:60]
+        if slug and slug != jira_id.lower():
+            return f"{jira_id}-{slug}"
+        return jira_id
+
+    def _branch_folder_from_git(self, jira_id: str) -> Optional[str]:
+        """Look across workspace repos for a checked-out branch named like
+        `feature/<jira_id>-<slug>` (or `<jira_id>-<slug>`). Returns the bare
+        `<jira_id>-<slug>` form, or None if nothing matches.
+        """
+        repos = self._original_workspace or self.workspace or {}
+        jira_lower = jira_id.lower()
+        for path in repos.values():
+            if not path or not os.path.isdir(os.path.join(path, ".git")):
+                continue
+            try:
+                proc = subprocess.run(
+                    ["git", "-C", path, "branch", "--show-current"],
+                    capture_output=True, text=True, timeout=5,
+                )
+            except (OSError, subprocess.SubprocessError):
+                continue
+            branch = (proc.stdout or "").strip()
+            if not branch:
+                continue
+            bare = branch[len("feature/"):] if branch.startswith("feature/") else branch
+            if bare.lower() == jira_lower:
+                continue  # bare jira_id is no better than the fallback
+            if bare.lower().startswith(jira_lower + "-"):
+                return bare
+        return None
+
     def _get_issue_dir(self) -> Optional[str]:
         """Return the issue directory path for the current JIRA ID or MR, or None."""
         if not self.issues_dir:
             return None
-        task_str = self.state.get("task") or ""
-        jira_match = self._JIRA_RE.search(task_str)
-
-        if jira_match:
-            jira_id = jira_match.group(1)
-            # Build slug from task title (text after JIRA ID, or full task if ID is embedded)
-            title_part = task_str[jira_match.end():].strip()
-            if not title_part:
-                # JIRA ID alone — use text before it or the full task
-                title_part = task_str[:jira_match.start()].strip() or task_str
-            slug = re.sub(r"[^a-zA-Z0-9]+", "-", title_part).strip("-").lower()
-            slug = slug[:60]
-            folder_name = f"{jira_id}-{slug}" if slug else jira_id
+        folder_name = self._jira_folder_name()
+        if folder_name:
             return os.path.join(self.issues_dir, folder_name)
 
         # Fallback: MR URL → "MR-42-group-project"
@@ -420,7 +482,7 @@ class Circle:
         with open(filepath, "w", encoding="utf-8") as fh:
             fh.write(output)
 
-        logger.info("Issue doc sauvegarde: %s", filepath)
+        logger.info("Issue doc saved: %s", filepath)
         return filepath
 
     def _next_run_number(self) -> int:
@@ -433,7 +495,7 @@ class Circle:
     def _build_prompt(self, skill: Dict[str, Any]) -> str:
         workspace_str = "\n".join(
             f"- {k}: {v}" for k, v in self.workspace.items()
-        ) if self.workspace else "(aucun workspace)"
+        ) if self.workspace else "(no workspace)"
 
         feedback = ""
         if self._feedback_buffer:
@@ -459,7 +521,7 @@ class Circle:
             issue_context = resolve_issue_context(jira_id, self.docs_path, self.workspace)
             self.state.setdefault("step_outputs", {})[issue_ctx_key] = issue_context
         else:
-            issue_context = self.state.get("step_outputs", {}).get(issue_ctx_key, "(aucun contexte issue)")
+            issue_context = self.state.get("step_outputs", {}).get(issue_ctx_key, "(no issue context)")
 
         mr_project, mr_iid = self._parse_mr_url()
         pre_run_output = self.state.get("step_outputs", {}).get("_pre_run", "")
@@ -474,7 +536,7 @@ class Circle:
         variables: Dict[str, str] = {
             "task": task_str,
             "instructions": all_instructions,
-            "previous_output": self.state.get("previous_output") or "(aucun)",
+            "previous_output": self.state.get("previous_output") or "(none)",
             "workspace": workspace_str,
             "forge_name": self.name,
             "docs_path": self.docs_path,
@@ -484,7 +546,7 @@ class Circle:
             "mr_iid": mr_iid,
             "pre_run_output": pre_run_output,
             "post_run_output": post_run_output,
-            "reviewer_feedback": reviewer_feedback or "(aucun — premier passage)",
+            "reviewer_feedback": reviewer_feedback or "(none — first pass)",
         }
 
         for step_name, step_output in self.state.get("step_outputs", {}).items():
@@ -510,12 +572,12 @@ class Circle:
     def _evaluate_pass_condition(self, condition: str, output: str) -> bool:
         data = extract_json(output)
         if data is None:
-            logger.warning("Circle %s: impossible d'extraire du JSON pour la condition", self.name)
+            logger.warning("Forge %s: could not extract JSON for condition", self.name)
             return False
         try:
             return safe_evaluate_condition(condition, data)
         except Exception as exc:
-            logger.error("Circle %s: erreur évaluation condition: %s", self.name, exc)
+            logger.error("Forge %s: condition evaluation error: %s", self.name, exc)
             return False
 
     # ------------------------------------------------------------------
@@ -537,6 +599,15 @@ class Circle:
             score = data.get("score", "")
             if verdict:
                 summary = f"[verdict={verdict}, score={score}] {summary}"
+                # Persist as last_review for status display
+                self.state["last_review"] = {
+                    "skill": skill_name,
+                    "verdict": str(verdict),
+                    "score": score if isinstance(score, (int, float)) else None,
+                    "summary": str(data.get("summary", ""))[:300],
+                    "blocking_issues": len(data.get("blocking_issues") or []),
+                    "when": time.time(),
+                }
             summaries[skill_name] = summary
         else:
             # Fallback: first 500 chars of output
@@ -608,7 +679,7 @@ class Circle:
 
             await self.bus.publish(Message(
                 source="forge",
-                content=f"📡 **Circle {self.name}** → /{skill_name} ({state['total_chars']} chars)...\n```\n{preview}\n```",
+                content=f"📡 **Forge {self.name}** → /{skill_name} ({state['total_chars']} chars)...\n```\n{preview}\n```",
                 level="debug",
                 forge_name=self.name,
                 skill_name=skill_name,
@@ -626,7 +697,7 @@ class Circle:
             elapsed += INTERVAL
             await self.bus.publish(Message(
                 source="forge",
-                content=f"⏳ **Circle {self.name}** → /{skill_name} en cours ({elapsed}s, runner={runner_name})",
+                content=f"⏳ **Forge {self.name}** → /{skill_name} running ({elapsed}s, runner={runner_name})",
                 level="debug",
                 forge_name=self.name,
                 skill_name=skill_name,
@@ -654,6 +725,336 @@ class Circle:
             err = stderr.decode("utf-8", errors="replace").strip()
             raise RuntimeError(f"git {' '.join(args)} failed in {os.path.basename(repo_path)}: {err}")
         return stdout.decode("utf-8", errors="replace").strip()
+
+    async def _glab_json(self, repo_path: str, *args: str, timeout: int = 20) -> Optional[Any]:
+        """Run a glab command with JSON output, return parsed result or None."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "glab", *args,
+                cwd=repo_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except (FileNotFoundError, OSError) as exc:
+            logger.debug("Forge %s: glab not available: %s", self.name, exc)
+            return None
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            logger.warning("Forge %s: glab %s timed out", self.name, " ".join(args))
+            return None
+        if proc.returncode != 0:
+            err = stderr.decode("utf-8", errors="replace").strip()[:200]
+            logger.debug("Forge %s: glab %s rc=%d: %s", self.name, " ".join(args), proc.returncode, err)
+            return None
+        raw = stdout.decode("utf-8", errors="replace").strip()
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            logger.debug("Forge %s: glab output not JSON: %s", self.name, raw[:100])
+            return None
+
+    async def refresh_external_snapshot(self) -> Dict[str, Any]:
+        """Fetch MR + pipeline state from GitLab via glab (on-demand).
+
+        Best-effort: missing glab, missing branch, network errors are silently
+        skipped. Stored in state["external_snapshot"]. Returns the snapshot.
+        """
+        # Ensure we know branches first
+        if not self.state.get("git_snapshot"):
+            await self.refresh_git_snapshot()
+        git_snap = self.state.get("git_snapshot") or {}
+        if not git_snap:
+            return {}
+
+        snapshot: Dict[str, Any] = {}
+        now = time.time()
+
+        async def _fetch_repo(repo_name: str, repo_path: str, branch: str) -> Tuple[str, Dict[str, Any]]:
+            info: Dict[str, Any] = {"refreshed_at": now, "branch": branch}
+            # MR for this branch — include all states (opened/merged/closed)
+            mrs = await self._glab_json(
+                repo_path, "mr", "list", "--source-branch", branch, "--all", "-F", "json"
+            )
+            mr_pick: Optional[Dict[str, Any]] = None
+            if isinstance(mrs, list) and mrs:
+                # Prefer opened, then most recent
+                opened = [m for m in mrs if (m.get("state") == "opened")]
+                pool = opened or mrs
+                mr_pick = max(pool, key=lambda m: m.get("updated_at") or m.get("created_at") or "")
+            if mr_pick:
+                info["mr"] = {
+                    "iid": mr_pick.get("iid"),
+                    "state": mr_pick.get("state"),
+                    "title": (mr_pick.get("title") or "")[:120],
+                    "web_url": mr_pick.get("web_url"),
+                    "draft": bool(mr_pick.get("draft") or mr_pick.get("work_in_progress")),
+                    "target_branch": mr_pick.get("target_branch"),
+                }
+            else:
+                info["mr"] = None
+
+            # Latest pipeline on this branch
+            pipelines = await self._glab_json(
+                repo_path, "ci", "list", "-r", branch, "-P", "1", "-F", "json"
+            )
+            pipe_pick: Optional[Dict[str, Any]] = None
+            if isinstance(pipelines, list) and pipelines:
+                pipe_pick = pipelines[0]
+            elif isinstance(pipelines, dict):
+                pipe_pick = pipelines
+            if pipe_pick:
+                info["pipeline"] = {
+                    "id": pipe_pick.get("id"),
+                    "status": pipe_pick.get("status"),
+                    "web_url": pipe_pick.get("web_url"),
+                    "sha": (pipe_pick.get("sha") or "")[:8],
+                    "ref": pipe_pick.get("ref"),
+                    "updated_at": pipe_pick.get("updated_at"),
+                }
+            else:
+                info["pipeline"] = None
+
+            return repo_name, info
+
+        coros = []
+        for repo_name, repo_info in git_snap.items():
+            branch = repo_info.get("branch")
+            repo_path = self.workspace.get(repo_name)
+            if not branch or not repo_path or not os.path.isdir(repo_path):
+                continue
+            # Skip default branches — no MR is expected
+            if branch in ("develop", "main", "master"):
+                continue
+            coros.append(_fetch_repo(repo_name, repo_path, branch))
+
+        if coros:
+            results = await asyncio.gather(*coros, return_exceptions=True)
+            for r in results:
+                if isinstance(r, tuple):
+                    repo_name, info = r
+                    snapshot[repo_name] = info
+                elif isinstance(r, Exception):
+                    logger.warning("Forge %s: external refresh error: %s", self.name, r)
+
+        self.state["external_snapshot"] = snapshot
+        self._save_state()
+        return snapshot
+
+    async def refresh_git_snapshot(self) -> None:
+        """Refresh per-repo git snapshot in state for status display.
+
+        Best-effort: per-repo failures are caught so one bad repo does not
+        prevent others from being inspected. Stored in state["git_snapshot"].
+        """
+        if not self.workspace:
+            return
+        snapshot: Dict[str, Any] = {}
+        now = time.time()
+        for repo_name, repo_path in self.workspace.items():
+            if not repo_path or not os.path.isdir(repo_path):
+                continue
+            info: Dict[str, Any] = {"refreshed_at": now}
+            try:
+                info["branch"] = await self._git_exec(repo_path, "branch", "--show-current", timeout=10) or None
+            except RuntimeError:
+                info["branch"] = None
+            info["ahead"] = None
+            info["behind"] = None
+            info["base"] = None
+            for base in ("origin/develop", "origin/main", "origin/master"):
+                try:
+                    counts = await self._git_exec(
+                        repo_path, "rev-list", "--left-right", "--count", f"{base}...HEAD", timeout=10
+                    )
+                    parts = counts.split()
+                    if len(parts) == 2:
+                        info["behind"] = int(parts[0])
+                        info["ahead"] = int(parts[1])
+                        info["base"] = base
+                        break
+                except (RuntimeError, ValueError):
+                    continue
+            try:
+                line = await self._git_exec(
+                    repo_path, "log", "-1", "--pretty=format:%h%x00%s%x00%cr", timeout=10
+                )
+                parts = line.split("\0")
+                info["last_sha"] = parts[0] if len(parts) > 0 else ""
+                info["last_msg"] = (parts[1][:80] if len(parts) > 1 else "")
+                info["last_msg_when"] = parts[2] if len(parts) > 2 else ""
+            except RuntimeError:
+                info["last_sha"] = ""
+                info["last_msg"] = ""
+                info["last_msg_when"] = ""
+            try:
+                porcelain = await self._git_exec(repo_path, "status", "--porcelain", timeout=10)
+                lines = [ln for ln in porcelain.splitlines() if ln.strip()]
+                info["dirty"] = bool(lines)
+                info["dirty_count"] = len(lines)
+            except RuntimeError:
+                info["dirty"] = False
+                info["dirty_count"] = 0
+            snapshot[repo_name] = info
+        self.state["git_snapshot"] = snapshot
+        self._save_state()
+
+    def _worktree_paths_active(self) -> bool:
+        if not self.use_git_worktree or not self._original_workspace or not self.workspace:
+            return False
+        sample = next(iter(self.workspace.values()), "")
+        return bool(sample and ".dispatch-worktrees" in os.path.normpath(sample))
+
+    async def _git_fetch_default_remote(self, main_path: str) -> None:
+        try:
+            await self._git_exec(main_path, "fetch", "origin", timeout=120)
+        except RuntimeError as exc:
+            logger.warning("Forge %s: git fetch in %s: %s", self.name, main_path, exc)
+
+    async def _choose_worktree_start_ref(self, main_path: str) -> str:
+        for ref in ("origin/develop", "origin/main", "develop", "main"):
+            try:
+                await self._git_exec(main_path, "rev-parse", "--verify", ref, timeout=15)
+                return ref
+            except RuntimeError:
+                continue
+        raise RuntimeError(
+            f"Aucun ref develop/main utilisable pour worktree (repo {os.path.basename(main_path)})."
+        )
+
+    async def _remove_stale_worktree_path(self, main_path: str, wt_path: str) -> None:
+        try:
+            await self._git_exec(main_path, "worktree", "remove", "--force", wt_path, timeout=60)
+        except RuntimeError:
+            if os.path.isdir(wt_path):
+                shutil.rmtree(wt_path, ignore_errors=True)
+        try:
+            await self._git_exec(main_path, "worktree", "prune", timeout=20)
+        except RuntimeError:
+            pass
+
+    async def _ensure_git_worktrees(self) -> None:
+        """One isolated worktree per main clone under .dispatch-worktrees/issues/<id>/."""
+        if not self.use_git_worktree or self._worktree_paths_active():
+            return
+
+        task_str = self.state.get("task") or ""
+        jira_m = self._JIRA_RE.search(task_str)
+        if not jira_m:
+            logger.warning(
+                "Forge %s: worktree requis mais pas d'ID ticket (ex. KANTA-123) dans la tache",
+                self.name,
+            )
+            return
+        jira_id = jira_m.group(1)
+        if not self._original_workspace:
+            return
+
+        first_main = next(iter(self._original_workspace.values()), "")
+        if not first_main or not os.path.isdir(os.path.join(first_main, ".git")):
+            return
+        base_path = os.path.dirname(os.path.normpath(first_main))
+        # Use `<jira_id>-<title-slug>` for the worktree folder (matches issue dir).
+        folder_name = self._jira_folder_name() or jira_id
+        issue_safe = re.sub(r"[^\w\-.]+", "-", folder_name)
+        wt_base = os.path.join(base_path, ".dispatch-worktrees", "issues", issue_safe)
+        self._worktree_registry.clear()
+
+        for repo_name, main_path in self._original_workspace.items():
+            if not os.path.isdir(os.path.join(main_path, ".git")):
+                continue
+            st = await self._git_exec(
+                main_path, "status", "--porcelain", "--untracked-files=no", timeout=30,
+            )
+            if st:
+                raise RuntimeError(
+                    f"Depot {repo_name}: modifications non commitees sur le clone principal. "
+                    f"Stashez/committez {main_path} avant d'utiliser le workflow."
+                )
+            await self._git_fetch_default_remote(main_path)
+            start_ref = await self._choose_worktree_start_ref(main_path)
+            folder = os.path.basename(os.path.normpath(main_path))
+            wt_path = os.path.join(wt_base, folder)
+            if os.path.exists(wt_path):
+                await self._remove_stale_worktree_path(main_path, wt_path)
+            await self._git_exec(
+                main_path,
+                "worktree", "add", "-B", f"feature/{jira_id}", wt_path, start_ref,
+                timeout=120,
+            )
+            self._worktree_registry.append((main_path, wt_path, repo_name))
+            self.workspace[repo_name] = wt_path
+            await self.bus.publish(Message(
+                source="forge",
+                content=f"🌿 **{self.name}** → worktree **{repo_name}** : `{wt_path}` (branche `feature/{jira_id}`)",
+                level="info",
+                forge_name=self.name,
+            ))
+
+        if self._worktree_registry:
+            await self.bus.publish(Message(
+                source="forge",
+                content=f"🌳 **{self.name}** → {len(self._worktree_registry)} worktree(s) prets (ID `{jira_id}`). Les clones "
+                f"sous `{base_path}/.dispatch-worktrees` sont isoles du depot principal.",
+                level="info",
+                forge_name=self.name,
+            ))
+
+    async def _teardown_git_worktrees(self) -> None:
+        if not self._worktree_registry:
+            self.workspace = dict(self._original_workspace)
+            return
+        for main_path, wt_path, repo_name in self._worktree_registry:
+            try:
+                await self._remove_stale_worktree_path(main_path, wt_path)
+            except Exception as exc:
+                logger.warning("Worktree remove %s: %s", wt_path, exc)
+                await self.bus.publish(Message(
+                    source="forge",
+                    content=f"⚠ **{self.name}** — impossible de supprimer proprement le worktree {repo_name}: {exc}",
+                    level="warning",
+                    forge_name=self.name,
+                ))
+        self._worktree_registry.clear()
+        self.workspace = dict(self._original_workspace)
+        await self.bus.publish(Message(
+            source="forge",
+            content=f"🧹 **{self.name}** → worktrees supprimes, workspace restaure sur les clones principaux.",
+            level="info",
+            forge_name=self.name,
+        ))
+
+    def _teardown_git_worktrees_sync(self) -> None:
+        if not self._worktree_registry:
+            self.workspace = dict(self._original_workspace)
+            return
+        for main_path, wt_path, _name in self._worktree_registry:
+            try:
+                subprocess.run(
+                    ["git", "worktree", "remove", "--force", wt_path],
+                    cwd=main_path,
+                    capture_output=True,
+                    timeout=60,
+                )
+            except OSError as exc:
+                logger.warning("Worktree remove sync: %s", exc)
+            if os.path.isdir(wt_path):
+                shutil.rmtree(wt_path, ignore_errors=True)
+            try:
+                subprocess.run(
+                    ["git", "worktree", "prune"],
+                    cwd=main_path,
+                    capture_output=True,
+                    timeout=20,
+                )
+            except OSError:
+                pass
+        self._worktree_registry.clear()
+        self.workspace = dict(self._original_workspace)
 
     def _resolve_run_cwd(self) -> Optional[str]:
         """Determine the working directory for runner execution.
@@ -693,7 +1094,7 @@ class Circle:
 
         await self.bus.publish(Message(
             source="forge",
-            content=f"🔀 **Circle {self.name}** → Verification git **{repo_name}**",
+            content=f"🔀 **Forge {self.name}** → Git check **{repo_name}**",
             level="info",
             forge_name=self.name,
             skill_name=skill_name,
@@ -712,11 +1113,11 @@ class Circle:
         current_branch = await self._git_exec(repo_path, "branch", "--show-current")
 
         if current_branch.startswith(f"feature/{jira_id}"):
-            logger.info("Repo %s: deja sur %s", repo_name, current_branch)
+            logger.info("Repo %s: already on %s", repo_name, current_branch)
             try:
                 await self._git_exec(repo_path, "pull", "--ff-only", "origin", current_branch)
             except RuntimeError:
-                logger.info("Repo %s: pas d'upstream pour %s, continue", repo_name, current_branch)
+                logger.info("Repo %s: no upstream for %s, continuing", repo_name, current_branch)
             await self.bus.publish(Message(
                 source="forge",
                 content=f"  ✅ **{repo_name}** — branche `{current_branch}` prete",
@@ -724,13 +1125,13 @@ class Circle:
                 forge_name=self.name,
             ))
         else:
-            logger.info("Repo %s: sur %s, creation %s", repo_name, current_branch, expected_branch)
+            logger.info("Repo %s: on %s, creating %s", repo_name, current_branch, expected_branch)
 
             await self._git_exec(repo_path, "checkout", "develop")
             try:
                 await self._git_exec(repo_path, "pull", "origin", "develop")
             except RuntimeError:
-                logger.warning("Repo %s: pull develop echoue, continue", repo_name)
+                logger.warning("Repo %s: pull develop failed, continuing", repo_name)
 
             try:
                 await self._git_exec(repo_path, "flow", "feature", "start", jira_id)
@@ -750,14 +1151,14 @@ class Circle:
 
     async def _prepare_git(self, skill_name: str) -> None:
         """Prepare git workspace before implement (parallel across repos)."""
-        skill = self.skills.get(skill_name, {})
+        skill = self.spells.get(skill_name, {})
         if not skill.get("git_prepare", False):
             return
 
         task_str = self.state.get("task") or ""
         jira_match = self._JIRA_RE.search(task_str)
         if not jira_match:
-            logger.warning("Circle %s: pas de JIRA ID, skip git prepare", self.name)
+            logger.warning("Forge %s: no JIRA ID, skipping git prepare", self.name)
             return
         jira_id = jira_match.group(1)
 
@@ -769,7 +1170,7 @@ class Circle:
             if not os.path.isdir(os.path.join(repo_path, ".git")):
                 continue
             if affected and repo_name not in affected:
-                logger.info("Repo %s: non concerne par le plan, skip", repo_name)
+                logger.info("Repo %s: not in plan, skipping", repo_name)
                 continue
             repos_to_prepare.append((repo_name, repo_path))
 
@@ -789,7 +1190,7 @@ class Circle:
 
         await self.bus.publish(Message(
             source="forge",
-            content=f"🔀 **Circle {self.name}** → Workspace git pret pour /{skill_name} ({len(repos_to_prepare)} repos)",
+            content=f"🔀 **Forge {self.name}** → Git workspace ready for /{skill_name} ({len(repos_to_prepare)} repos)",
             level="info",
             forge_name=self.name,
         ))
@@ -809,7 +1210,7 @@ class Circle:
             return
         jira_id = jira_match.group(1)
 
-        comment = f"[Arcane] Forge {self.name} — /{skill_name} termine.\n{summary[:500]}"
+        comment = f"[Dispatch] workflow {self.name} — /{skill_name} completed.\n{summary[:500]}"
         prompt = (
             f"Ajoute un commentaire sur le ticket JIRA {jira_id}. "
             f"Contenu du commentaire :\n\n{comment}\n\n"
@@ -840,9 +1241,9 @@ class Circle:
                 proc.communicate(input=prompt.encode("utf-8")),
                 timeout=60,
             )
-            logger.info("Circle %s: JIRA %s notifie pour /%s", self.name, jira_id, skill_name)
+            logger.info("Forge %s: JIRA %s notified for /%s", self.name, jira_id, skill_name)
         except Exception as exc:
-            logger.warning("Circle %s: notification JIRA echouee: %s", self.name, exc)
+            logger.warning("Forge %s: JIRA notification failed: %s", self.name, exc)
 
     # ------------------------------------------------------------------
     # Git finalize (push + MR creation)
@@ -850,20 +1251,20 @@ class Circle:
 
     async def _finalize_git(self, skill_name: str) -> None:
         """Push branch and create MR after a successful skill (when git_finalize is set)."""
-        skill = self.skills.get(skill_name, {})
+        skill = self.spells.get(skill_name, {})
         if not skill.get("git_finalize", False):
             return
 
         task_str = self.state.get("task") or ""
         jira_match = self._JIRA_RE.search(task_str)
         if not jira_match:
-            logger.warning("Circle %s: pas de JIRA ID, skip git finalize", self.name)
+            logger.warning("Forge %s: no JIRA ID, skipping git finalize", self.name)
             return
         jira_id = jira_match.group(1)
 
         # Get plan summary for MR description (if available)
         plan_output = self.state.get("step_outputs", {}).get("plan", "")
-        mr_description = f"Ritual Arcane pour {jira_id}"
+        mr_description = f"Dispatch workflow for {jira_id}"
         if plan_output:
             from forge import extract_json
             plan_data = extract_json(plan_output)
@@ -889,7 +1290,7 @@ class Circle:
 
             await self.bus.publish(Message(
                 source="forge",
-                content=f"🚀 **Circle {self.name}** → Push **{repo_name}** branche `{current_branch}`",
+                content=f"🚀 **Forge {self.name}** → Push **{repo_name}** branch `{current_branch}`",
                 level="info",
                 forge_name=self.name,
                 skill_name=skill_name,
@@ -901,7 +1302,7 @@ class Circle:
             except RuntimeError as exc:
                 await self.bus.publish(Message(
                     source="forge",
-                    content=f"⚠️ **Circle {self.name}** → Push echoue pour **{repo_name}** : {exc}",
+                    content=f"⚠️ **Forge {self.name}** → Push failed for **{repo_name}** : {exc}",
                     level="warning",
                     forge_name=self.name,
                 ))
@@ -926,7 +1327,7 @@ class Circle:
                 if proc.returncode == 0:
                     await self.bus.publish(Message(
                         source="forge",
-                        content=f"✅ **Circle {self.name}** → MR creee pour **{repo_name}** : {mr_output}",
+                        content=f"✅ **Forge {self.name}** → MR created for **{repo_name}** : {mr_output}",
                         level="info",
                         forge_name=self.name,
                         skill_name=skill_name,
@@ -935,14 +1336,14 @@ class Circle:
                     err = stderr.decode("utf-8", errors="replace").strip()
                     await self.bus.publish(Message(
                         source="forge",
-                        content=f"⚠️ **Circle {self.name}** → Creation MR echouee pour **{repo_name}** : {err[:300]}",
+                        content=f"⚠️ **Forge {self.name}** → MR creation failed for **{repo_name}** : {err[:300]}",
                         level="warning",
                         forge_name=self.name,
                     ))
             except (asyncio.TimeoutError, FileNotFoundError) as exc:
                 await self.bus.publish(Message(
                     source="forge",
-                    content=f"⚠️ **Circle {self.name}** → glab non disponible pour la creation MR : {exc}",
+                    content=f"⚠️ **Forge {self.name}** → glab not available for MR creation : {exc}",
                     level="warning",
                     forge_name=self.name,
                 ))
@@ -964,41 +1365,82 @@ class Circle:
             .replace("{workspace_first}", workspace_first)
         )
 
-        logger.info("Circle %s: %s pour /%s: %s", self.name, hook_name, skill_name, cmd[:100])
+        logger.info("Forge %s: %s for /%s (timeout=%ds): %s", self.name, hook_name, skill_name, timeout_s, cmd[:100])
         await self.bus.publish(Message(
             source="forge",
-            content=f"⚡ **Circle {self.name}** → /{skill_name} {hook_name} en cours...",
+            content=f"⚡ **Forge {self.name}** → /{skill_name} {hook_name} running... (timeout {timeout_s}s)",
             level="info",
             forge_name=self.name,
             skill_name=skill_name,
         ))
 
+        proc: Optional[asyncio.subprocess.Process] = None
         try:
             proc = await asyncio.create_subprocess_shell(
                 cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,  # own process group → kill children too
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
             output = stdout.decode("utf-8", errors="replace")
 
             if proc.returncode != 0:
                 err = stderr.decode("utf-8", errors="replace").strip()
-                logger.warning("Circle %s: %s failed (rc=%d): %s", self.name, hook_name, proc.returncode, err[:200])
+                logger.warning("Forge %s: %s failed (rc=%d): %s", self.name, hook_name, proc.returncode, err[:200])
                 # For post_run, include both stdout and stderr (test results may be in either)
                 return f"{output}\n(exit code {proc.returncode})\n{err[:500]}" if hook_name == "post_run" else f"({hook_name} error: {err[:500]})"
 
-            logger.info("Circle %s: %s OK (%d chars)", self.name, hook_name, len(output))
+            logger.info("Forge %s: %s OK (%d chars)", self.name, hook_name, len(output))
             return output
         except asyncio.TimeoutError:
-            logger.warning("Circle %s: %s timeout (%ds)", self.name, hook_name, timeout_s)
-            return f"({hook_name} timeout)"
+            logger.warning("Forge %s: %s timeout (%ds) — killing process group", self.name, hook_name, timeout_s)
+            await self._kill_proc_group(proc)
+            partial = ""
+            if proc is not None and proc.stdout is not None:
+                try:
+                    data = await asyncio.wait_for(proc.stdout.read(), timeout=2)
+                    partial = data.decode("utf-8", errors="replace").strip()[-1500:]
+                except (asyncio.TimeoutError, Exception):
+                    pass
+            suffix = f"\n--- last stdout ---\n{partial}" if partial else ""
+            return f"({hook_name} timeout after {timeout_s}s){suffix}"
         except Exception as exc:
-            logger.warning("Circle %s: %s exception: %s", self.name, hook_name, exc)
+            logger.warning("Forge %s: %s exception: %s", self.name, hook_name, exc)
+            await self._kill_proc_group(proc)
             return f"({hook_name} error: {exc})"
 
+    @staticmethod
+    async def _kill_proc_group(proc: Optional[asyncio.subprocess.Process]) -> None:
+        """Best-effort kill of the subprocess and its children (for `start_new_session=True`)."""
+        if proc is None or proc.returncode is not None:
+            return
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                return
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2)
+            except asyncio.TimeoutError:
+                pass
+
     async def _run_skill(self, skill_name: str) -> str:
-        skill = self.skills[skill_name]
+        skill = self.spells[skill_name]
+
+        await self._ensure_git_worktrees()
 
         # Git preparation (if configured for this skill)
         await self._prepare_git(skill_name)
@@ -1006,7 +1448,8 @@ class Circle:
         # Pre-run bash hook (e.g. fetch MR diff before calling the runner)
         pre_run_template = skill.get("pre_run")
         if pre_run_template:
-            pre_run_output = await self._exec_hook(skill_name, "pre_run", pre_run_template)
+            pre_run_timeout = int(skill.get("pre_run_timeout", 120))
+            pre_run_output = await self._exec_hook(skill_name, "pre_run", pre_run_template, timeout_s=pre_run_timeout)
             self.state.setdefault("step_outputs", {})["_pre_run"] = pre_run_output
 
         runner_name = skill.get("runner") or self.default_runner
@@ -1035,14 +1478,14 @@ class Circle:
                 try:
                     with open(cache_path, "r", encoding="utf-8") as fh:
                         cache_hit = fh.read()
-                    logger.info("Circle %s: cache hit pour /%s (hash=%s)", self.name, skill_name, prompt_hash)
+                    logger.info("Forge %s: cache hit for /%s (hash=%s)", self.name, skill_name, prompt_hash)
                 except OSError:
                     cache_hit = None
 
         if cache_hit is not None:
             await self.bus.publish(Message(
                 source="forge",
-                content=f"⚡ **Circle {self.name}** → /{skill_name} — cache hit (resultat identique au run precedent)",
+                content=f"⚡ **Forge {self.name}** → /{skill_name} — cache hit (same result as previous run)",
                 level="info",
                 forge_name=self.name,
                 skill_name=skill_name,
@@ -1053,7 +1496,7 @@ class Circle:
 
         await self.bus.publish(Message(
             source="forge",
-            content=f"🔧 **Circle {self.name}** → /{skill_name} — {skill.get('description', '')} (runner={runner_name}, timeout={skill_timeout}s)",
+            content=f"⚒️ **Forge {self.name}** → /{skill_name} — {skill.get('description', '')} (runner={runner_name}, timeout={skill_timeout}s)",
             level="info",
             forge_name=self.name,
             skill_name=skill_name,
@@ -1062,7 +1505,7 @@ class Circle:
         # Determine cwd: use first affected repo, or first workspace repo
         run_cwd = self._resolve_run_cwd()
 
-        logger.info("Circle %s: lancement skill /%s (runner=%s, timeout=%ds, cwd=%s)",
+        logger.info("Forge %s: starting skill /%s (runner=%s, timeout=%ds, cwd=%s)",
                      self.name, skill_name, runner_name, skill_timeout,
                      os.path.basename(run_cwd) if run_cwd else ".")
 
@@ -1090,11 +1533,11 @@ class Circle:
             last_error = result.stderr
             if attempt < max_runner_retries:
                 backoff = 5 * (attempt + 1)  # 5s, 10s
-                logger.warning("Circle %s: /%s runner echoue (tentative %d/%d), retry dans %ds: %s",
+                logger.warning("Forge %s: /%s runner failed (attempt %d/%d), retry in %ds: %s",
                                self.name, skill_name, attempt + 1, 1 + max_runner_retries, backoff, last_error[:200])
                 await self.bus.publish(Message(
                     source="forge",
-                    content=f"⚠️ **Circle {self.name}** → /{skill_name} erreur transitoire (tentative {attempt + 1}), retry dans {backoff}s...",
+                    content=f"⚠️ **Forge {self.name}** → /{skill_name} transient error (attempt {attempt + 1}), retry in {backoff}s...",
                     level="warning",
                     forge_name=self.name,
                     skill_name=skill_name,
@@ -1104,7 +1547,7 @@ class Circle:
         if result is None or not result.success:
             await self.bus.publish(Message(
                 source="forge",
-                content=f"❌ **Circle {self.name}** → /{skill_name} erreur apres {1 + max_runner_retries} tentatives ({result.runner_used if result else '?'}): {last_error[:500]}",
+                content=f"❌ **Forge {self.name}** → /{skill_name} error after {1 + max_runner_retries} attempts ({result.runner_used if result else '?'}): {last_error[:500]}",
                 level="error",
                 forge_name=self.name,
                 skill_name=skill_name,
@@ -1118,7 +1561,7 @@ class Circle:
         if validation_error:
             await self.bus.publish(Message(
                 source="forge",
-                content=f"⚠️ **Circle {self.name}** → /{skill_name} output invalide : {validation_error}",
+                content=f"⚠️ **Forge {self.name}** → /{skill_name} invalid output: {validation_error}",
                 level="warning",
                 forge_name=self.name,
                 skill_name=skill_name,
@@ -1145,14 +1588,14 @@ class Circle:
 
         await self.bus.publish(Message(
             source="forge",
-            content=f"✅ **Circle {self.name}** → /{skill_name} terminé ({output_len} chars, runner={result.runner_used})\n📄 `{os.path.basename(output_file)}`\n```\n{preview}\n```",
+            content=f"✅ **Forge {self.name}** → /{skill_name} done ({output_len} chars, runner={result.runner_used})\n📄 `{os.path.basename(output_file)}`\n```\n{preview}\n```",
             level="info",
             forge_name=self.name,
             skill_name=skill_name,
             data={"runner_used": result.runner_used, "output_file": output_file},
         ))
 
-        logger.info("Circle %s: skill /%s terminé (runner=%s, %d chars)", self.name, skill_name, result.runner_used, output_len)
+        logger.info("Forge %s: skill /%s done (runner=%s, %d chars)", self.name, skill_name, result.runner_used, output_len)
 
         # Record execution metrics
         duration_s = round(time.monotonic() - t_start, 1)
@@ -1180,13 +1623,14 @@ class Circle:
         # Post-run bash hook (e.g. run tests after implement)
         post_run_template = skill.get("post_run")
         if post_run_template:
-            post_run_output = await self._exec_hook(skill_name, "post_run", post_run_template, timeout_s=300)
+            post_run_timeout = int(skill.get("post_run_timeout", 300))
+            post_run_output = await self._exec_hook(skill_name, "post_run", post_run_template, timeout_s=post_run_timeout)
             self.state.setdefault("step_outputs", {})["_post_run"] = post_run_output
             # Truncate for storage but keep full output available
             post_summary = post_run_output.strip()[-2000:] if len(post_run_output) > 2000 else post_run_output.strip()
             await self.bus.publish(Message(
                 source="forge",
-                content=f"🧪 **Circle {self.name}** → /{skill_name} post_run terminé\n```\n{post_summary[:500]}\n```",
+                content=f"🧪 **Forge {self.name}** → /{skill_name} post_run done\n```\n{post_summary[:500]}\n```",
                 level="info",
                 forge_name=self.name,
                 skill_name=skill_name,
@@ -1246,11 +1690,30 @@ class Circle:
                 names.extend(self._get_parallel_skills(step))
         return names
 
+    def format_workflow(self, with_backticks: bool = True) -> str:
+        """Render the ritual as a human-readable arrow chain.
+
+        Parallel steps render as `(a | b | c)` instead of leaking the dict literal.
+        """
+        def render(name: str) -> str:
+            return f"`/{name}`" if with_backticks else f"/{name}"
+
+        parts: List[str] = []
+        for step in self.workflow:
+            if isinstance(step, str):
+                parts.append(render(step))
+            elif self._is_parallel_step(step):
+                inner = " | ".join(render(s) for s in self._get_parallel_skills(step))
+                parts.append(f"({inner})")
+            else:
+                parts.append(str(step))
+        return " → ".join(parts)
+
     async def _run_parallel_skills(self, skill_names: List[str]) -> None:
         """Run multiple skills in parallel using asyncio.gather."""
         await self.bus.publish(Message(
             source="forge",
-            content=f"⚡ **Circle {self.name}** → Lancement parallele : {', '.join(f'/{s}' for s in skill_names)}",
+            content=f"⚡ **Forge {self.name}** → Parallel start: {', '.join(f'/{s}' for s in skill_names)}",
             level="info",
             forge_name=self.name,
         ))
@@ -1272,6 +1735,7 @@ class Circle:
                 name, output = result
                 self._save_skill_output(name, output)
                 self.state["step_outputs"][name] = output
+                self._store_step_summary(name, output)
 
         if errors:
             raise RuntimeError(f"Parallel skills failed: {'; '.join(errors)}")
@@ -1282,7 +1746,7 @@ class Circle:
 
         await self.bus.publish(Message(
             source="forge",
-            content=f"✅ **Circle {self.name}** → Parallel terminé : {', '.join(f'/{s}' for s in skill_names)}",
+            content=f"✅ **Forge {self.name}** → Parallel done: {', '.join(f'/{s}' for s in skill_names)}",
             level="info",
             forge_name=self.name,
         ))
@@ -1293,7 +1757,7 @@ class Circle:
 
     async def run_workflow(self, task: str, instructions: Optional[str] = None) -> None:
         run_number = self._next_run_number()
-        logger.info("Circle %s: démarrage workflow run #%d", self.name, run_number)
+        logger.info("Forge %s: starting workflow run #%d", self.name, run_number)
 
         self.state["status"] = "running"
         self.state["task"] = task
@@ -1307,19 +1771,23 @@ class Circle:
         self._save_state()
 
         try:
-            await self._execute_from_current()
-        except Exception as exc:
-            self.state["status"] = "error"
-            self.state["error"] = str(exc)
-            self._save_state()
-            self._archive_run()
-            logger.error("Circle %s: erreur fatale run #%d: %s", self.name, run_number, exc)
-            await self.bus.publish(Message(
-                source="forge",
-                content=f"💥 **Circle {self.name}** — erreur fatale : {exc}",
-                level="error",
-                forge_name=self.name,
-            ))
+            try:
+                await self._execute_from_current()
+            except Exception as exc:
+                self.state["status"] = "error"
+                self.state["error"] = str(exc)
+                self._save_state()
+                self._archive_run()
+                logger.error("Forge %s: fatal error run #%d: %s", self.name, run_number, exc)
+                await self.bus.publish(Message(
+                    source="forge",
+                    content=f"💥 **Forge {self.name}** — fatal error: {exc}",
+                    level="error",
+                    forge_name=self.name,
+                ))
+        finally:
+            if self.use_git_worktree and self.state.get("status") == "completed":
+                await self._teardown_git_worktrees()
 
     async def run_single_skill(
         self,
@@ -1327,7 +1795,7 @@ class Circle:
         task: str,
         instructions: Optional[str] = None,
     ) -> str:
-        if skill_name not in self.skills:
+        if skill_name not in self.spells:
             raise ValueError(f"Skill inconnu : {skill_name}")
 
         run_number = self._next_run_number()
@@ -1335,27 +1803,32 @@ class Circle:
         self.state["task"] = task
         self.state["instructions"] = instructions
         self.state["current_skill"] = skill_name
+        self.state["current_skill_started_at"] = time.time()
         self.state["run_number"] = run_number
         self._save_state()
 
         try:
-            output = await self._run_skill(skill_name)
-            self._save_skill_output(skill_name, output)
-            self.state["step_outputs"][skill_name] = output
-            self.state["previous_output"] = output
+            try:
+                output = await self._run_skill(skill_name)
+                self._save_skill_output(skill_name, output)
+                self.state["step_outputs"][skill_name] = output
+                self.state["previous_output"] = output
 
-            # Extract summary for context compression (inter-agent communication)
-            self._store_step_summary(skill_name, output)
-            self.state["status"] = "idle"
-            self._save_state()
-            self._archive_run()
-            return output
-        except Exception as exc:
-            self.state["status"] = "error"
-            self.state["error"] = str(exc)
-            self._save_state()
-            self._archive_run()
-            raise
+                # Extract summary for context compression (inter-agent communication)
+                self._store_step_summary(skill_name, output)
+                self.state["status"] = "idle"
+                self._save_state()
+                self._archive_run()
+                return output
+            except Exception as exc:
+                self.state["status"] = "error"
+                self.state["error"] = str(exc)
+                self._save_state()
+                self._archive_run()
+                raise
+        finally:
+            if self.use_git_worktree and self.state.get("status") == "idle":
+                await self._teardown_git_worktrees()
 
     async def _execute_from_current(self) -> None:
         while self.state["current_index"] < len(self.workflow):
@@ -1365,8 +1838,10 @@ class Circle:
             if self._is_parallel_step(step):
                 parallel_skills = self._get_parallel_skills(step)
                 self.state["current_skill"] = f"parallel:{','.join(parallel_skills)}"
+                self.state["current_skill_started_at"] = time.time()
                 self._save_state()
 
+                await self.refresh_git_snapshot()
                 await self._run_parallel_skills(parallel_skills)
 
                 self.state["current_index"] += 1
@@ -1375,9 +1850,13 @@ class Circle:
 
             # --- Sequential step ---
             skill_name = step
-            skill = self.skills[skill_name]
+            skill = self.spells[skill_name]
             self.state["current_skill"] = skill_name
+            self.state["current_skill_started_at"] = time.time()
             self._save_state()
+
+            # Refresh git snapshot before running so external commits show up in status
+            await self.refresh_git_snapshot()
 
             output = await self._run_skill(skill_name)
 
@@ -1399,12 +1878,12 @@ class Circle:
 
                     if retries >= self.max_retries:
                         self.state["status"] = "failed"
-                        self.state["error"] = f"{skill_name} échoué après {retries} essais"
+                        self.state["error"] = f"{skill_name} failed after {retries} attempts"
                         self._save_state()
                         self._archive_run()
                         await self.bus.publish(Message(
                             source="forge",
-                            content=f"💥 **Circle {self.name}** → {skill_name} échoué après {retries} essais. Workflow arrêté.",
+                            content=f"💥 **Forge {self.name}** → {skill_name} failed after {retries} attempts. Workflow stopped.",
                             level="error",
                             forge_name=self.name,
                             skill_name=skill_name,
@@ -1429,7 +1908,7 @@ class Circle:
 
                         await self.bus.publish(Message(
                             source="forge",
-                            content=f"🔄 **Circle {self.name}** → {skill_name} rejeté (essai {retries}/{self.max_retries}). Retour à /{next_on_fail}\n📋 Feedback transmis au prochain agent",
+                            content=f"🔄 **Forge {self.name}** → {skill_name} rejected (attempt {retries}/{self.max_retries}). Back to /{next_on_fail}\n📋 Feedback passed to the next agent",
                             level="warning",
                             forge_name=self.name,
                             skill_name=skill_name,
@@ -1451,7 +1930,7 @@ class Circle:
 
                 await self.bus.publish(Message(
                     source="forge",
-                    content=f"⏸ **Circle {self.name}** en pause après /{skill_name}",
+                    content=f"⏸ **Forge {self.name}** paused after /{skill_name}",
                     level="info",
                     forge_name=self.name,
                     skill_name=skill_name,
@@ -1481,12 +1960,13 @@ class Circle:
 
         self.state["status"] = "completed"
         self.state["current_skill"] = None
+        self.state["current_skill_started_at"] = None
         self._save_state()
         self._archive_run()
 
         await self.bus.publish(Message(
             source="forge",
-            content=f"🏁 **Circle {self.name}** — workflow terminé avec succès (run #{self.state['run_number']})",
+            content=f"🏁 **Forge {self.name}** — workflow completed successfully (run #{self.state['run_number']})",
             level="info",
             forge_name=self.name,
         ))
@@ -1517,15 +1997,17 @@ class Circle:
         self.state["status"] = "paused"
         self.state["error"] = f"Avorte par l'utilisateur (skill /{self.state.get('current_skill', '?')})"
         self._save_state()
-        logger.info("Circle %s: abort demande", self.name)
+        logger.info("Forge %s: abort requested", self.name)
         return True
 
     def reset(self) -> None:
         if self._running_task and not self._running_task.done():
             self._running_task.cancel()
+        self._teardown_git_worktrees_sync()
         self.state = {
             "status": "idle",
             "current_skill": None,
+            "current_skill_started_at": None,
             "current_index": 0,
             "task": None,
             "instructions": None,
@@ -1534,9 +2016,19 @@ class Circle:
             "previous_output": None,
             "error": None,
             "run_number": self.state.get("run_number", 0),
+            "last_review": None,
+            "git_snapshot": self.state.get("git_snapshot", {}),
+            "external_snapshot": {},
         }
         self._feedback_buffer.clear()
         self._extra_instructions = None
+        self._save_state()
+
+    def reset_metrics(self) -> None:
+        """Zero out persistent counters (skill_metrics, run_number) and reset state."""
+        self.reset()
+        self.state["skill_metrics"] = {}
+        self.state["run_number"] = 0
         self._save_state()
 
     # ------------------------------------------------------------------
@@ -1557,7 +2049,7 @@ class Circle:
         # Keep the task and step_outputs from the previous run
         task = self.state.get("task")
         if not task:
-            raise ValueError("Pas de tâche en cours — lancez d'abord un workflow complet")
+            raise ValueError("No task in progress — run a full workflow first")
 
         previous_outputs = dict(self.state.get("step_outputs", {}))
         # Remove outputs from the restart index and all subsequent steps
@@ -1566,12 +2058,13 @@ class Circle:
                 previous_outputs.pop(name, None)
 
         run_number = self._next_run_number()
-        logger.info("Circle %s: reprise depuis /%s (run #%d)", self.name, skill_name, run_number)
+        logger.info("Forge %s: resuming from /%s (run #%d)", self.name, skill_name, run_number)
 
         self.state["status"] = "running"
         self.state["instructions"] = instructions or self.state.get("instructions")
         self.state["current_index"] = start_index
         self.state["current_skill"] = skill_name
+        self.state["current_skill_started_at"] = time.time()
         self.state["retries"] = {}
         self.state["step_outputs"] = previous_outputs
         self.state["_skip_cache"] = True  # Force re-execution on restart
@@ -1589,23 +2082,36 @@ class Circle:
         self._save_state()
 
         try:
-            await self._execute_from_current()
-        except Exception as exc:
-            self.state["status"] = "error"
-            self.state["error"] = str(exc)
-            self._save_state()
-            self._archive_run()
-            logger.error("Circle %s: erreur run #%d: %s", self.name, run_number, exc)
-            await self.bus.publish(Message(
-                source="forge",
-                content=f"💥 **Circle {self.name}** — erreur fatale : {exc}",
-                level="error",
-                forge_name=self.name,
-            ))
+            try:
+                await self._execute_from_current()
+            except Exception as exc:
+                self.state["status"] = "error"
+                self.state["error"] = str(exc)
+                self._save_state()
+                self._archive_run()
+                logger.error("Forge %s: run #%d error: %s", self.name, run_number, exc)
+                await self.bus.publish(Message(
+                    source="forge",
+                    content=f"💥 **Forge {self.name}** — fatal error: {exc}",
+                    level="error",
+                    forge_name=self.name,
+                ))
+        finally:
+            if self.use_git_worktree and self.state.get("status") == "completed":
+                await self._teardown_git_worktrees()
 
     # ------------------------------------------------------------------
     # Status
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        s = max(0, int(seconds))
+        if s < 60:
+            return f"{s}s"
+        if s < 3600:
+            return f"{s // 60}m{s % 60:02d}s"
+        return f"{s // 3600}h{(s % 3600) // 60:02d}m"
 
     @property
     def progress_bar(self) -> str:
@@ -1632,11 +2138,25 @@ class Circle:
             "completed": "\U0001f535", "failed": "\U0001f534", "error": "\U0001f534",
         }.get(status, "\u26aa")
 
-        current = s.get("current_skill", "")
-        skill_info = f" `/{current}`" if current and status == "running" else ""
-        task_short = (s.get("task") or "")[:50]
+        current = s.get("current_skill", "") or ""
+        skill_info = ""
+        if current and status == "running":
+            started = s.get("current_skill_started_at")
+            elapsed = f" ({self._format_duration(time.time() - started)})" if started else ""
+            skill_info = f" `/{current}`{elapsed}"
+        elif current and status == "paused":
+            skill_info = f" \u23f8 `/{current}`"
 
-        return f"{icon} **{self.name}** {bar} {pct}%{skill_info} \u2014 {task_short}"
+        task_str = s.get("task") or ""
+        jira_match = self._JIRA_RE.search(task_str)
+        jira_part = f"{jira_match.group(1)} \u00b7 " if jira_match else ""
+        # Strip JIRA prefix from task to avoid duplication
+        task_clean = task_str
+        if jira_match:
+            task_clean = (task_str[:jira_match.start()] + task_str[jira_match.end():]).strip(" -:\u00b7")
+        task_short = task_clean[:50]
+
+        return f"{icon} **{self.name}** {bar} {pct}%{skill_info} \u2014 {jira_part}{task_short}"
 
     @property
     def status_summary(self) -> str:
@@ -1646,6 +2166,23 @@ class Circle:
         )
         current = s.get("current_skill")
         status = s.get("status", "idle")
+
+        metrics = s.get("skill_metrics", {}) or {}
+
+        def _step_suffix(name: str) -> str:
+            m = metrics.get(name) or {}
+            parts = []
+            runner = m.get("runner_used")
+            if runner:
+                parts.append(runner)
+            dur = m.get("duration_s")
+            if isinstance(dur, (int, float)):
+                parts.append(self._format_duration(dur))
+            tok = m.get("tokens") or {}
+            total = tok.get("total") if isinstance(tok, dict) else None
+            if isinstance(total, (int, float)) and total > 0:
+                parts.append(f"{int(total / 1000)}k tok" if total >= 1000 else f"{int(total)} tok")
+            return f" _({', '.join(parts)})_" if parts else ""
 
         # Build visual workflow progress
         steps: List[str] = []
@@ -1657,14 +2194,14 @@ class Circle:
                 icons = []
                 for s in p_skills:
                     if s in completed_skills:
-                        icons.append(f"✅`/{s}`")
+                        icons.append(f"✅`/{s}`{_step_suffix(s)}")
                     elif is_current:
                         icons.append(f"🔄`/{s}`")
                     else:
                         icons.append(f"⬜`/{s}`")
                 label = " | ".join(icons)
                 if is_current:
-                    steps.append(f"  ⚡ [{label}] ← parallele")
+                    steps.append(f"  ⚡ [{label}] ← parallel")
                 elif all_done:
                     steps.append(f"  ⚡ [{label}]")
                 else:
@@ -1672,39 +2209,132 @@ class Circle:
             else:
                 skill = step
                 if skill in completed_skills:
-                    steps.append(f"  ✅ `/{skill}`")
+                    steps.append(f"  ✅ `/{skill}`{_step_suffix(skill)}")
                 elif skill == current and status == "running":
-                    steps.append(f"  🔄 `/{skill}` ← en cours")
+                    started = self.state.get("current_skill_started_at")
+                    elapsed = self._format_duration(time.time() - started) if started else "?"
+                    steps.append(f"  🔄 `/{skill}` ← running ({elapsed})")
                 elif skill == current and status == "paused":
-                    steps.append(f"  ⏸ `/{skill}` ← en pause")
+                    steps.append(f"  ⏸ `/{skill}` ← paused")
                 elif skill == current and status in ("error", "failed"):
-                    steps.append(f"  ❌ `/{skill}` ← échoué")
+                    steps.append(f"  ❌ `/{skill}` ← failed")
                 else:
                     steps.append(f"  ⬜ `/{skill}`")
 
-        status_icon = {
-            "idle": "⚪", "running": "🟢", "paused": "🟡",
-            "completed": "🔵", "failed": "🔴", "error": "🔴",
-        }.get(status, "⚪")
+        task_str = self.state.get("task") or "—"
+        jira_match = self._JIRA_RE.search(task_str)
+        jira_id = jira_match.group(1) if jira_match else None
+        header_task = f"[{jira_id}] {task_str[:120]}" if jira_id else task_str[:120]
 
         lines = [
             self.progress_bar,
-            f"\U0001f4cb Tache : {(s.get('task') or chr(8212))[:120]}",
+            f"\U0001f4cb Task: {header_task}",
             "",
             "**Workflow :**",
         ]
         lines.extend(steps)
 
+        # Last review verdict (set after any review skill with a verdict field)
+        last_review = self.state.get("last_review")
+        if last_review and last_review.get("verdict"):
+            verdict = last_review.get("verdict") or "?"
+            score = last_review.get("score")
+            score_str = f"{score}/100" if isinstance(score, (int, float)) else "—"
+            block_n = last_review.get("blocking_issues") or 0
+            block_str = f" · {block_n} blocking" if block_n else ""
+            review_skill = last_review.get("skill") or "review"
+            lines.append(
+                f"\n🔍 Dernière review (`/{review_skill}`) : **{score_str}** · {verdict}{block_str}"
+            )
+
+        # External snapshot (GitLab MR + pipeline) — on-demand via `!<forge> sync`
+        ext_snap = self.state.get("external_snapshot") or {}
+        if ext_snap:
+            lines.append("\n**Remote** (GitLab):")
+            mr_state_icon = {
+                "opened": "🟢", "merged": "🟣", "closed": "⚫",
+            }
+            pipe_state_icon = {
+                "success": "✅", "failed": "❌", "running": "🔄",
+                "pending": "⏳", "canceled": "🚫", "skipped": "⏭",
+                "manual": "✋", "created": "🆕",
+            }
+            for repo_name, info in ext_snap.items():
+                mr = info.get("mr")
+                if mr:
+                    icon = mr_state_icon.get(mr.get("state"), "📋")
+                    draft = " (draft)" if mr.get("draft") else ""
+                    title = mr.get("title") or ""
+                    url = mr.get("web_url") or ""
+                    iid = mr.get("iid")
+                    target = mr.get("target_branch") or ""
+                    target_part = f" → `{target}`" if target else ""
+                    mr_line = f"  • **{repo_name}** MR : {icon} !{iid} {mr.get('state')}{draft}{target_part} — {title[:60]}"
+                    if url:
+                        mr_line += f"\n    {url}"
+                    lines.append(mr_line)
+                else:
+                    lines.append(f"  • **{repo_name}** MR : _(none for this branch)_")
+                pipe = info.get("pipeline")
+                if pipe:
+                    icon = pipe_state_icon.get(pipe.get("status"), "❓")
+                    sha = pipe.get("sha") or ""
+                    sha_part = f" @ `{sha}`" if sha else ""
+                    pipe_line = f"    Pipeline : {icon} {pipe.get('status')}{sha_part}"
+                    if pipe.get("web_url"):
+                        pipe_line += f" — {pipe.get('web_url')}"
+                    lines.append(pipe_line)
+            ext_refreshed = max(
+                (i.get("refreshed_at", 0) for i in ext_snap.values()), default=0
+            )
+            if ext_refreshed:
+                age = time.time() - ext_refreshed
+                if age > 60:
+                    lines.append(f"  _(remote snapshot age: {self._format_duration(age)})_")
+
+        # Git snapshot — surface external work done outside Mycel
+        git_snap = self.state.get("git_snapshot") or {}
+        if git_snap:
+            lines.append("\n**Git** (workspace state):")
+            for repo_name, info in git_snap.items():
+                branch = info.get("branch") or "(detached)"
+                base = (info.get("base") or "").replace("origin/", "")
+                ahead = info.get("ahead")
+                behind = info.get("behind")
+                ab_parts = []
+                if isinstance(ahead, int) and isinstance(behind, int) and base:
+                    if ahead or behind:
+                        ab_parts.append(f"↑{ahead} ↓{behind} vs {base}")
+                    else:
+                        ab_parts.append(f"= {base}")
+                dirty_count = info.get("dirty_count") or 0
+                if dirty_count:
+                    ab_parts.append(f"📝 {dirty_count} uncommitted")
+                last_sha = info.get("last_sha") or ""
+                last_msg = info.get("last_msg") or ""
+                last_when = info.get("last_msg_when") or ""
+                tail = f" — `{last_sha}` {last_msg} _({last_when})_" if last_sha else ""
+                ab_str = f" ({', '.join(ab_parts)})" if ab_parts else ""
+                lines.append(f"  • **{repo_name}** : `{branch}`{ab_str}{tail}")
+            # Hint when refresh is stale (>5 min)
+            refreshed = max(
+                (i.get("refreshed_at", 0) for i in git_snap.values()), default=0
+            )
+            if refreshed and time.time() - refreshed > 300:
+                lines.append(
+                    f"  _(snapshot age: {self._format_duration(time.time() - refreshed)})_"
+                )
+
         if s.get("error"):
-            lines.append(f"\n⚠️ Erreur : {s['error']}")
+            lines.append(f"\n⚠️ Error: {s['error']}")
         if s.get("retries"):
-            retries_str = ", ".join(f"/{k}: {v}/3" for k, v in s["retries"].items())
-            lines.append(f"🔄 Retries : {retries_str}")
+            retries_str = ", ".join(f"/{k}: {v}/{self.max_retries}" for k, v in s["retries"].items())
+            lines.append(f"🔄 Retries: {retries_str}")
 
         # Hint for available actions
         if status in ("error", "failed"):
-            lines.append(f"\n💡 `!{self.name} from <skill>` pour reprendre depuis une étape")
+            lines.append(f"\n💡 `!{self.name} from <skill>` to resume from a step")
         elif status == "paused":
-            lines.append(f"\n💡 `!{self.name} resume` pour continuer")
+            lines.append(f"\n💡 `!{self.name} resume` to continue")
 
         return "\n".join(lines)
