@@ -1,8 +1,8 @@
 # Mycel
 
-Multi-agent orchestrator for Discord-driven AI-Driven Development (AIDD). Each configured **forge** (`forges:` in YAML) runs a **ritual** of **spells** by invoking **familiars** (Claude Code, Gemini, Cursor) as subprocesses.
+Multi-agent orchestrator for Discord-driven AI-Driven Development (AIDD). Each configured **forge** (`forges:` in YAML) runs a **workflow** of **steps** by invoking **agents** (Claude Code, Gemini, Cursor) as subprocesses.
 
-The Mycel network connects Forges; each Forge runs a Ritual cast by Familiars.
+The Mycel network connects Forges; each Forge runs a Workflow executed by Agents.
 
 ## Requirements
 
@@ -45,8 +45,8 @@ python discord_bot.py
 !dev LAB-1890 Add geographic zones
 !bugfix LAB-1234 Fix /api/orders crash
 !review https://gitlab.com/org/api/-/merge_requests/456
-!<forge> spell <name> [instructions]
-!<forge> from <spell> [instructions]
+!<forge> step <name> [instructions]
+!<forge> from <step> [instructions]
 !<forge> resume / retry / abort / reset / status / log [N]
 !<forge> reset metrics                  # reset state + zero skill_metrics & run_number
 ```
@@ -56,7 +56,7 @@ python discord_bot.py
 ```
 !mycel status
 !mycel forges
-!mycel spells
+!mycel steps
 !mycel metrics
 !mycel mcp                              # check MCP server health
 !mycel reload
@@ -66,16 +66,16 @@ python discord_bot.py
 !mycel aikido check | start | stop | status
 ```
 
-`!dispatch` is kept as a backwards-compat alias for `!mycel`. Subcommands accept legacy synonyms (`workflow`/`circles` → `forges`, `skill`/`skills` → `spells`). Inside a forge command, `spell` / `skill` / `step` are interchangeable.
+`!dispatch` is kept as a backwards-compat alias for `!mycel`. Subcommands accept legacy synonyms (`workflow`/`circles` → `forges`, `spells`/`skill`/`skills` → `steps`). Inside a forge command, `step` / `spell` / `skill` are interchangeable.
 
-Slash: `/forge`, `/spell` (cast), `/mycel` group with `status`, `forges`, `spells`, `metrics`, `mcp`, `reload`, `reset-metrics`.
+Slash: `/forge`, `/spell` (run a step), `/mycel` group with `status`, `forges`, `steps`, `metrics`, `mcp`, `reload`, `reset-metrics`.
 
 ## Layout
 
 | File | Role |
 |------|------|
 | `mycel.py` | Config, queues, workers, monitors |
-| `forge.py` | `Forge` ritual engine |
+| `forge.py` | `Forge` workflow engine |
 | `runner.py` | CLI runners + streaming |
 | `message_bus.py` | Bus + JSONL |
 | `discord_bot.py` | Bot UI |

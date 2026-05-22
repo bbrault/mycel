@@ -2,9 +2,9 @@
 
 ## 1. Objectif
 
-Mycel est un orchestrateur multi-agents piloté par Discord pour le développement assisté par IA (AIDD). Un canal Discord est associé à une **forge** ; l’utilisateur envoie une **tâche** (ticket Jira, incident Sentry, URL de merge request, etc.). Mycel enchaîne des **sorts** (invocation de prompts) exécutés par des **familiers** (CLI : Claude Code, Gemini, Cursor Agent) en sous-processus, avec journalisation sur un **bus** et persistance d’état par forge.
+Mycel est un orchestrateur multi-agents piloté par Discord pour le développement assisté par IA (AIDD). Un canal Discord est associé à une **forge** ; l’utilisateur envoie une **tâche** (ticket Jira, incident Sentry, URL de merge request, etc.). Mycel enchaîne des **étapes** (invocation de prompts) exécutées par des **agents** (CLI : Claude Code, Gemini, Cursor Agent) en sous-processus, avec journalisation sur un **bus** et persistance d’état par forge.
 
-Métaphore du projet : le réseau **Mycel** relie des **Forges** ; chaque forge exécute un **Rituel** (suite de sorts) ; chaque sort est lancé par un **Familier**.
+Le réseau **Mycel** relie des **Forges** ; chaque forge exécute un **Workflow** (suite d’étapes) ; chaque étape est exécutée par un **Agent**.
 
 ## 2. Architecture
 
@@ -13,13 +13,13 @@ Métaphore du projet : le réseau **Mycel** relie des **Forges** ; chaque forge 
 ```
 discord_bot.py
     → mycel.py      (files d’attente par forge, routage, reload, monitors)
-        → forge.py  (rituel, sorts parallèles, git, cache, echo reviewer)
+        → forge.py  (workflow, étapes parallèles, git, cache, echo reviewer)
             → runner.py (sous-processus, stdin = prompt, streaming)
     → message_bus.py → Discord (fil, streaming, boutons)
 ```
 
-- **`mycel.py`** : charge `mycel_config.yaml` et `spells.yaml`, construit les instances `Forge`, une file `asyncio.Queue` par forge, worker async qui dépile et lance `Forge.run_workflow` (ou sort isolé / reprise). Gère `reload_config()`, disponibilité des familiers, branchement des monitors.
-- **`forge.py`** : machine d’état d’un rituel, étapes séquentielles ou **groupe parallèle** (`parallel:` dans le YAML du rituel), hooks `pre_run` / `post_run`, préparation git / worktrees, validation de sortie, métriques, feedback revue (`{reviewer_feedback}`).
+- **`mycel.py`** : charge `mycel_config.yaml` et `spells.yaml`, construit les instances `Forge`, une file `asyncio.Queue` par forge, worker async qui dépile et lance `Forge.run_workflow` (ou étape isolée / reprise). Gère `reload_config()`, disponibilité des agents, branchement des monitors.
+- **`forge.py`** : machine d’état d’un workflow, étapes séquentielles ou **groupe parallèle** (`parallel:` dans le YAML du workflow), hooks `pre_run` / `post_run`, préparation git / worktrees, validation de sortie, métriques, feedback revue (`{reviewer_feedback}`).
 - **`runner.py`** : `ClaudeRunner`, `GeminiRunner`, `CursorRunner` avec repli possible, parsing usage tokens / coût depuis stderr Claude, répertoire de travail = dépôt workspace.
 - **`message_bus.py`** : pub/sub async, persistance des messages en JSONL sous `bus/`.
 - **`discord_bot.py`** : commandes préfixées `!`, slash commands, permissions par rôle, fils de discussion, tableau de bord épinglé, boutons interactifs.
@@ -42,15 +42,15 @@ flowchart LR
 
 ## 3. Files d’attente et cycle de vie (`Mycel`)
 
-- Chaque forge possède une file d’objets `_QueueItem` (tâche, instructions optionnelles, éventuellement `spell_name` pour sort isolé ou `from_spell` pour reprise).
+- Chaque forge possède une file d’objets `_QueueItem` (tâche, instructions optionnelles, éventuellement `spell_name` pour étape isolée ou `from_spell` pour reprise).
 - Un worker async traite un élément à la fois **par forge** (pas de chevauchement de deux rituels sur la même forge).
 - Le hot-reload (`reload_config`) recharge YAML et met à jour `forge.spells` ; les forges nouvellement déclarées dans le YAML peuvent être instanciées sans redémarrage du bot.
 
-## 4. Forge : rituel, parallèle, état
+## 4. Forge : workflow, parallèle, état
 
-### 4.1 Rituel
+### 4.1 Workflow
 
-Le rituel est la liste `ritual:` dans la config de la forge. Chaque élément est soit le nom d’un sort (chaîne), soit un dictionnaire `parallel: [sort1, sort2, ...]` exécuté via `asyncio.gather` dans `forge.py`.
+Le workflow est la liste `ritual:` dans la config de la forge. Chaque élément est soit le nom d’une étape (chaîne), soit un dictionnaire `parallel: [step1, step2, ...]` exécuté via `asyncio.gather` dans `forge.py`.
 
 ### 4.2 Persistance
 
@@ -84,29 +84,29 @@ Fichier principal (nom legacy supporté : `dispatch_config.yaml` si le nouveau f
 |------|------|
 | `repos` | Carte clé logique → nom de dossier du clone sur disque. |
 | `workspace_groups` | Groupe : `base_env` (variable d’environnement = racine des clones), liste `repos`, option `git_worktree`. |
-| `defaults` | `familiar`, `max_retries`, `timeout` par défaut. |
+| `defaults` | `familiar` (agent), `max_retries`, `timeout` par défaut. |
 | `claude` | Ex. `allowed_tools`, `permission_mode` passés au CLI. |
 | `sentry_monitor` / `aikido_monitor` | `enabled`, `interval`, `auto_fix`, listes de niveaux / sévérités. |
 | `permissions` | Rôles Discord → liste de forges autorisées (ou `all`). |
-| `forges` | Nom de forge → `channel`, `workspace_group`, `familiar`, `ritual`, option `on_complete`, `description`, surcharge `git_worktree`. |
+| `forges` | Nom de forge → `channel`, `workspace_group`, `familiar` (agent), `ritual` (workflow), option `on_complete`, `description`, surcharge `git_worktree`. |
 
 Les canaux sont des **noms** résolus par le bot vers des IDs Discord.
 
-## 8. Sorts — `spells.yaml`
+## 8. Steps — `spells.yaml`
 
 Fichier principal (fallback : `skills.yaml`). Clé racine `spells:` (legacy : `skills:`).
 
-Champs fréquents par sort :
+Champs fréquents par étape :
 
 | Champ | Rôle |
 |-------|------|
 | `prompt` / `prompt_file` | Texte du prompt ; `prompt_file` charge un fichier externe et peut substituer `$ARGUMENTS` par `{task}` et `{instructions}`. |
-| `runner` / `command` | Familier (`claude`, `gemini`, `cursor`) et éventuelle commande slash associée. |
+| `runner` / `command` | Agent (`claude`, `gemini`, `cursor`) et éventuelle commande slash associée. |
 | `timeout` | Délai du sous-processus. |
-| `runner_kwargs` | Surcharge (ex. `allowed_tools: null` pour un sort). |
-| `auto_advance`, `next_on_pass`, `next_on_fail`, `pass_condition` | Pilotage de la suite du rituel selon la sortie. |
+| `runner_kwargs` | Surcharge (ex. `allowed_tools: null` pour une étape). |
+| `auto_advance`, `next_on_pass`, `next_on_fail`, `pass_condition` | Pilotage de la suite du workflow selon la sortie. |
 | `pre_run` / `post_run` | Commandes shell optionnelles. |
-| `git_prepare` / `git_finalize` | Hooks git du sort. |
+| `git_prepare` / `git_finalize` | Hooks git de l'étape. |
 | `required_fields` | Validation de champs dans la sortie (JSON). |
 
 Les prompts utilisent des **variables de template** (voir section 9).
@@ -118,15 +118,15 @@ Variables courantes : `{task}`, `{instructions}`, `{previous_output}`, `{step_ou
 ### Quatre chemins d’entrée vers le prompt
 
 1. **Tâche initiale** — `!<forge> <texte libre>` : stocké dans `state["task"]`, expose `{task}` ; extraction `{jira_id}` par regex `\b([A-Z][A-Z0-9]+-\d+)\b` ; `{issue_context}` via fichiers locaux (`DOCS_PATH` / `ISSUES_DIR`).
-2. **Instructions de commande** — `spell`, `from`, `resume`, `retry` : texte additionnel → `state["instructions"]` / extensions `_extra_instructions` → `{instructions}`.
-3. **Message libre dans le fil** (sans préfixe `!`) : buffer RAM `_feedback_buffer`, flushé dans `{instructions}` au prochain rendu de prompt ; **non persisté** dans `state.json` (perte si crash avant le sort suivant).
+2. **Instructions de commande** — `step`, `from`, `resume`, `retry` : texte additionnel → `state["instructions"]` / extensions `_extra_instructions` → `{instructions}`.
+3. **Message libre dans le fil** (sans préfixe `!`) : buffer RAM `_feedback_buffer`, flushé dans `{instructions}` au prochain rendu de prompt ; **non persisté** dans `state.json` (perte si crash avant l’étape suivante).
 4. **Rejet d’une revue** : extraction dans `state["reviewer_feedback"]`, consommé au prochain prompt cible puis réinitialisé.
 
-Cas limites documentés dans l’ancienne version : absence d’ID Jira, message pendant un sort en cours (appliqué au sort **suivant**), placeholders manquants `(non disponible)` pour certains `step_output_*`.
+Cas limites documentés dans l’ancienne version : absence d’ID Jira, message pendant une étape en cours (appliqué à l’étape **suivante**), placeholders manquants `(non disponible)` pour certains `step_output_*`.
 
 ## 10. Journalisation
 
-Préfixes de loggers : `mycel.core`, `mycel.forge`, `mycel.familiar`, `mycel.bus`, `mycel.discord`, `mycel.sentry`, `mycel.aikido`.
+Préfixes de loggers : `mycel.core`, `mycel.forge`, `mycel.agent`, `mycel.bus`, `mycel.discord`, `mycel.sentry`, `mycel.aikido`.
 
 ## 11. Variables d’environnement (.env)
 
@@ -142,7 +142,7 @@ python3 -m py_compile mycel.py forge.py runner.py discord_bot.py message_bus.py 
 ## 13. Rétrocompatibilité
 
 - Alias de commande globale : `!dispatch` → `!mycel`.
-- Synonymes de sous-commandes : `forges`/`workflow`/`circles`, `spells`/`skill`/`skills` ; dans une commande forge : `spell`/`skill`/`step`.
+- Synonymes de sous-commandes : `forges`/`workflow`/`circles`, `steps`/`spells`/`skill`/`skills` ; dans une commande forge : `step`/`spell`/`skill`.
 - Fichiers et clés YAML legacy comme indiqué ci-dessus.
 - `state.json` conserve les noms de clés historiques (`current_skill`, etc.) pour ne pas casser les déploiements existants.
 

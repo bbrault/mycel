@@ -4,7 +4,7 @@ Ce guide s’adresse aux personnes qui lancent et suivent des travaux via Discor
 
 ## 1. À quoi sert Mycel ?
 
-Mycel enchaîne automatiquement des étapes d’IA (analyse, plan, implémentation, revue, etc.) sur vos dépôts, à partir d’un message dans le bon canal Discord. Chaque **forge** (ex. `dev`, `bugfix`, `sentry`) correspond à un **rituel** adapté au type de travail.
+Mycel enchaîne automatiquement des étapes d’IA (analyse, plan, implémentation, revue, etc.) sur vos dépôts, à partir d’un message dans le bon canal Discord. Chaque **forge** (ex. `dev`, `bugfix`, `sentry`) correspond à un **workflow** adapté au type de travail.
 
 ## 2. Prérequis côté Discord
 
@@ -12,7 +12,7 @@ Mycel enchaîne automatiquement des étapes d’IA (analyse, plan, implémentati
 - Vous devez disposer des **rôles** autorisés pour la forge que vous utilisez (voir `permissions` dans `mycel_config.yaml`).
 - Utiliser le **canal** configuré pour la forge (ex. `#dev` pour la forge `dev`).
 
-## 3. Démarrer un rituel
+## 3. Démarrer un workflow
 
 Dans le canal de la forge, envoyez une commande **`!<nom_forge>`** : le nom est **exactement** la clé définie sous `forges:` dans `mycel_config.yaml` (liste : `!mycel forges`). Exemples fréquents :
 
@@ -25,7 +25,7 @@ Dans le canal de la forge, envoyez une commande **`!<nom_forge>`** : le nom est 
 - `!devsecops …` — audit sécurité
 - `!aikido …` — remédiation Aikido
 
-Tout le texte après le préfixe est la **tâche** transmise au premier sort (souvent un identifiant Jira du type `PROJ-1234`, une description, ou une URL de MR).
+Tout le texte après le préfixe est la **tâche** transmise à la première étape (souvent un identifiant Jira du type `PROJ-1234`, une description, ou une URL de MR).
 
 Le bot crée en général un **fil de discussion (thread)** : continuez la conversation **dans ce fil** pour la même session.
 
@@ -44,7 +44,7 @@ Le bot crée en général un **fil de discussion (thread)** : continuez la conve
 
 ### Ajouter du contexte sans commande
 
-Dans le fil actif, un message **sans** préfixe `!` peut être pris comme **feedback** : le bot confirme souvent avec une réaction (ex. 📝). Ce texte est ajouté aux **instructions** du **prochain** sort — pas au sort déjà en cours.
+Dans le fil actif, un message **sans** préfixe `!` peut être pris comme **feedback** : le bot confirme souvent avec une réaction (ex. 📝). Ce texte est ajouté aux **instructions** de la **prochaine** étape — pas à l'étape déjà en cours.
 
 ### Commandes de contrôle (dans le fil ou le canal, selon habillage du bot)
 
@@ -52,7 +52,7 @@ Remplacez `<forge>` par le nom logique de la forge (`dev`, `bugfix`, etc.) :
 
 | Commande | Effet |
 |----------|--------|
-| `!<forge> status` | Affiche l’avancement du rituel. |
+| `!<forge> status` | Affiche l’avancement du workflow. |
 | `!<forge> log` ou `!<forge> log 50` | Dernières lignes du journal du bus pour cette forge. |
 | `!<forge> resume [texte]` | Reprend après une pause ; texte optionnel ajouté aux instructions. |
 | `!<forge> retry [texte]` | Relance l’étape en cours (échec / pause) ; texte optionnel. |
@@ -60,12 +60,12 @@ Remplacez `<forge>` par le nom logique de la forge (`dev`, `bugfix`, etc.) :
 | `!<forge> reset` | Remet la forge à l’état idle (conserve les **métriques** et le compteur de run). |
 | `!<forge> reset metrics` | Réinitialise l’état **et** remet à zéro les compteurs de métriques / numéro de run. |
 
-### Sort isolé ou reprise plus loin dans le rituel
+### Étape isolée ou reprise plus loin dans le workflow
 
 | Commande | Effet |
 |----------|--------|
-| `!<forge> spell <nom> [instructions]` | Exécute **un seul** sort (`spell`, `skill` et `step` sont équivalents). |
-| `!<forge> from <nom> [instructions]` | Reprend le rituel **à partir** de ce sort en **conservant** les sorties des étapes précédentes. |
+| `!<forge> step <nom> [instructions]` | Exécute **une seule** étape (`step`, `spell` et `skill` sont équivalents). |
+| `!<forge> from <nom> [instructions]` | Reprend le workflow **à partir** de cette étape en **conservant** les sorties des étapes précédentes. |
 
 ## 5. Commandes globales (`!mycel`)
 
@@ -75,7 +75,7 @@ Ces commandes ne ciblent pas une forge en particulier (sauf indication) :
 |----------|--------|
 | `!mycel status` | Vue d’ensemble : forges, files, familiers, extraits des monitors. |
 | `!mycel forges` | Liste des forges configurées (`workflow` / `circles` = synonymes). |
-| `!mycel spells` | Liste des sorts définis dans `spells.yaml`. |
+| `!mycel steps` | Liste des étapes définies dans `spells.yaml`. |
 | `!mycel metrics` | Temps, tokens, estimation de coût des derniers enregistrements. |
 | `!mycel mcp` | Santé des serveurs MCP vus par `claude mcp list`. |
 | `!mycel reload` | Recharge `mycel_config.yaml` et `spells.yaml` sans redémarrer le bot. |
@@ -91,8 +91,8 @@ Ces commandes ne ciblent pas une forge en particulier (sauf indication) :
 Disponibilité selon enregistrement du bot sur le serveur :
 
 - `/forge` — lancer un rituel avec nom de forge + tâche.
-- `/spell` — lancer un sort précis sur une forge.
-- Groupe `/mycel` — `status`, `forges`, `spells`, `metrics`, `mcp`, `reload`, `reset-metrics`, etc.
+- `/spell` — lancer une étape précise sur une forge.
+- Groupe `/mycel` — `status`, `forges`, `steps`, `metrics`, `mcp`, `reload`, `reset-metrics`, etc.
 
 ## 7. Permissions
 
@@ -111,9 +111,9 @@ Les rôles Discord sont associés à des listes de forges dans `mycel_config.yam
 |----------|--------|
 | « Rien ne se passe » | Vérifier le bon canal, les rôles, que le bot est en ligne. |
 | Erreur CLI / timeout | `!mycel status`, `!<forge> log` ; un timeout peut être augmenté dans `spells.yaml` ou `defaults`. |
-| Mauvaise étape | `status` puis `retry` ou `from <sort>` si vous voulez repartir d’un point précis. |
+| Mauvaise étape | `status` puis `retry` ou `from <étape>` si vous voulez repartir d’un point précis. |
 | Config modifiée | `!mycel reload` côté opérateur ; sinon redémarrage du process `python discord_bot.py`. |
-| Feedback non pris en compte | Le message sans `!` s’applique au **sort suivant** ; évitez d’envoyer pendant que le même sort tourne si vous attendez un changement immédiat — utilisez plutôt `abort` puis `resume` avec instructions. |
+| Feedback non pris en compte | Le message sans `!` s’applique à l’**étape suivante** ; évitez d’envoyer pendant que la même étape tourne si vous attendez un changement immédiat — utilisez plutôt `abort` puis `resume` avec instructions. |
 
 ## 10. Où en savoir plus ?
 
