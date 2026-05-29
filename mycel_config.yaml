@@ -1,6 +1,19 @@
 # Dispatch — circle (workflow) configuration
 # Paths from .env: WORKSPACE_FEATURE, WORKSPACE_BUG, WORKSPACE_REMEDIATION, etc.
 
+# GitLab SSH configuration for dynamic workspace cloning
+gitlab:
+  ssh_base: "git@gitlab.com:kanta-app"
+  docker_repo: "kanta-docker"
+
+# Mapping: repo key → kanta-docker .env variable name
+docker_env_mapping:
+  api: KANTA_LAB_API_V2_PATH
+  front: KANTA_LAB_FRONT_V2_PATH
+  database: KANTA_DATABASE_PATH
+  connector: KANTA_CONNECTOR_SYSTEM_PATH
+  basique-api: KANTA_BASIQUE_CLIENT_PATH
+
 # Repo folder names (same in each workspace)
 repos:
   api: kanta-api-v2
@@ -75,7 +88,9 @@ forges:
     familiar: claude
     channel: dev
     workspace_group: feature
+    dynamic_workspace: true
     ritual:
+      - analyze
       - elaborate
       - plan
       - arch-review
@@ -144,7 +159,10 @@ forges:
     familiar: claude
     channel: aikido
     workspace_group: remediation
+    dynamic_workspace: true
+    git_worktree: false
     ritual:
+      - analyze
       - fix
       - implement
       - tech-review
