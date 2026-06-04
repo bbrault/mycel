@@ -217,6 +217,10 @@ class Mycel:
             issues_dir=self.issues_dir,
             runner_kwargs=self.claude_config,
             use_git_worktree=self._forge_use_git_worktree(forge_cfg),
+            dynamic_workspace=bool(forge_cfg.get("dynamic_workspace", False)),
+            gitlab_config=self.config.get("gitlab", {}),
+            docker_env_mapping=self.config.get("docker_env_mapping", {}),
+            repo_folders=self._repo_folders,
         )
         self.forges[forge_name] = forge
 

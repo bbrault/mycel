@@ -11,7 +11,9 @@ import os
 import shutil
 import re
 import signal
+import socket
 import subprocess
+import tempfile
 import time
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple
 
@@ -117,6 +119,17 @@ _OPERATORS: Dict[type, Callable[[Any, Any], bool]] = {
 
 _MISSING = object()
 
+def _safe_evaluate_single(condition: str, data: Dict[str, Any]) -> bool:
+    """Evaluate a single comparison like ``verdict == 'approved'``."""
+    condition = condition.strip().strip("()")
+    for op_str in sorted(_OPERATORS, key=len, reverse=True):
+        if op_str not in condition:
+            continue
+        parts = condition.split(op_str, 1)
+        if len(parts) != 2:
+            continue
+        left_key = parts[0].strip()
+        right_raw = parts[1].strip().strip("'\"")
 
 def _compare(op_fn: Callable[[Any, Any], bool], left: Any, right: Any) -> bool:
     """Compare two values, preferring numeric comparison, falling back to string."""
@@ -164,20 +177,36 @@ def _eval_node(node: ast.AST, data: Dict[str, Any]) -> bool:
 
 
 def safe_evaluate_condition(condition: str, data: Dict[str, Any]) -> bool:
-    """Evaluate a boolean condition string against ``data`` without ``eval``.
+    """Evaluate a condition with optional ``and`` / ``or`` connectors and parentheses."""
+    condition = condition.strip()
+    # Strip outer parentheses: "(X or Y)" → "X or Y"
+    while condition.startswith("(") and condition.endswith(")"):
+        # Only strip if the parens actually wrap the whole expression
+        depth, balanced = 0, True
+        for i, ch in enumerate(condition):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            if depth == 0 and i < len(condition) - 1:
+                balanced = False
+                break
+        if balanced:
+            condition = condition[1:-1].strip()
+        else:
+            break
 
-    Supports field/literal comparisons (``==`` ``!=`` ``>=`` ``<=`` ``>`` ``<``)
-    combined with ``and`` / ``or`` / ``not`` and arbitrary parentheses, e.g.
-    ``(verdict == 'approved' or verdict == 'approved_with_reservations') and score >= 80``.
-    Numeric comparison is attempted first, falling back to string comparison.
-    Returns False on any unsupported or malformed expression.
-    """
-    try:
-        tree = ast.parse(condition, mode="eval")
-        return bool(_eval_node(tree.body, data))
-    except (SyntaxError, ValueError) as exc:
-        logger.warning("Invalid pass condition %r: %s", condition, exc)
-        return False
+    if " and " in condition:
+        return all(
+            safe_evaluate_condition(part.strip(), data)
+            for part in condition.split(" and ")
+        )
+    if " or " in condition:
+        return any(
+            safe_evaluate_condition(part.strip(), data)
+            for part in condition.split(" or ")
+        )
+    return _safe_evaluate_single(condition, data)
 
 
 # ------------------------------------------------------------------
@@ -288,6 +317,10 @@ class Forge:
         issues_dir: str = "",
         runner_kwargs: Optional[Dict[str, Any]] = None,
         use_git_worktree: bool = False,
+        dynamic_workspace: bool = False,
+        gitlab_config: Optional[Dict[str, Any]] = None,
+        docker_env_mapping: Optional[Dict[str, str]] = None,
+        repo_folders: Optional[Dict[str, str]] = None,
     ) -> None:
         self.name = name
         self.description = description
@@ -297,6 +330,12 @@ class Forge:
         self._original_workspace: Dict[str, str] = dict(workspace)
         self.use_git_worktree: bool = use_git_worktree
         self._worktree_registry: List[Tuple[str, str, str]] = []
+        self.dynamic_workspace: bool = dynamic_workspace
+        self._gitlab_config: Dict[str, Any] = gitlab_config or {}
+        self._docker_env_mapping: Dict[str, str] = docker_env_mapping or {}
+        self._repo_folders: Dict[str, str] = repo_folders or {}
+        self._dynamic_workspace_dir: Optional[str] = None
+        self._dynamic_workspace_port: Optional[int] = None
         self.docs_path = docs_path
         self.issues_dir = issues_dir
         self.runner_kwargs = runner_kwargs or {}
@@ -382,6 +421,11 @@ class Forge:
                 loaded.setdefault(key, default)
             self.state = loaded
 
+            dw = self.state.get("dynamic_workspace")
+            if dw and os.path.isdir(dw.get("dir", "")):
+                self._dynamic_workspace_dir = dw["dir"]
+                self._dynamic_workspace_port = dw.get("port")
+
     def _save_skill_output(self, skill_name: str, output: str) -> None:
         payload = {"skill": skill_name, "output": output}
 
@@ -441,7 +485,7 @@ class Forge:
         repos = self._original_workspace or self.workspace or {}
         jira_lower = jira_id.lower()
         for path in repos.values():
-            if not path or not os.path.isdir(os.path.join(path, ".git")):
+            if not self._is_git_repo(path):
                 continue
             try:
                 proc = subprocess.run(
@@ -924,6 +968,192 @@ class Forge:
         self.state["git_snapshot"] = snapshot
         self._save_state()
 
+    # ------------------------------------------------------------------
+    # Dynamic workspace provisioning
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _find_free_port(start: int = 8080, end: int = 9000) -> int:
+        for port in range(start, end):
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.bind(("127.0.0.1", port))
+                    return port
+            except OSError:
+                continue
+        raise RuntimeError(f"No free port found in range {start}-{end}")
+
+    async def _provision_dynamic_workspace(self) -> None:
+        if not self.dynamic_workspace or self._dynamic_workspace_dir:
+            return
+
+        analyze_output = self.state.get("step_outputs", {}).get("analyze")
+        if not analyze_output:
+            raise RuntimeError("dynamic_workspace enabled but no 'analyze' output found")
+
+        data = extract_json(analyze_output)
+        if not data or "required_repos" not in data:
+            raise RuntimeError("analyze output missing 'required_repos' field")
+
+        required_repos: List[str] = data["required_repos"]
+        if not required_repos:
+            raise RuntimeError("analyze returned empty required_repos list")
+
+        timestamp = int(time.time())
+        base_dir = os.path.join(tempfile.gettempdir(), "mycel-runs")
+        run_dir = os.path.join(base_dir, f"{self.name}-{timestamp}")
+        os.makedirs(run_dir, exist_ok=True)
+        self._dynamic_workspace_dir = run_dir
+
+        ssh_base = self._gitlab_config.get("ssh_base", "git@gitlab.com:kanta-app")
+        docker_repo = self._gitlab_config.get("docker_repo", "kanta-docker")
+
+        clone_targets: List[Tuple[str, str, str]] = []
+        for repo_key in required_repos:
+            folder = self._repo_folders.get(repo_key, repo_key)
+            url = f"{ssh_base}/{folder}.git"
+            clone_targets.append((repo_key, folder, url))
+
+        docker_url = f"{ssh_base}/{docker_repo}.git"
+        clone_targets.append(("_docker", docker_repo, docker_url))
+
+        await self.bus.publish(Message(
+            source="forge",
+            content=f"📦 **Forge {self.name}** — Cloning {len(clone_targets)} repos into `{run_dir}`",
+            level="info",
+            forge_name=self.name,
+        ))
+
+        async def _clone_one(repo_key: str, folder: str, url: str) -> Tuple[str, str]:
+            dest = os.path.join(run_dir, folder)
+            proc = await asyncio.create_subprocess_exec(
+                "git", "clone", url, dest,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
+            if proc.returncode != 0:
+                err = stderr.decode("utf-8", errors="replace").strip()
+                raise RuntimeError(f"Clone failed for {folder}: {err}")
+            logger.info("Forge %s: cloned %s → %s", self.name, folder, dest)
+            return repo_key, dest
+
+        results = await asyncio.gather(
+            *[_clone_one(k, f, u) for k, f, u in clone_targets],
+            return_exceptions=True,
+        )
+
+        errors = [str(r) for r in results if isinstance(r, BaseException)]
+        if errors:
+            await self._cleanup_dynamic_workspace()
+            raise RuntimeError(f"Dynamic workspace clone failed: {'; '.join(errors)}")
+
+        new_workspace: Dict[str, str] = {}
+        docker_path = ""
+        for r in results:
+            if isinstance(r, tuple):
+                repo_key, dest = r
+                if repo_key == "_docker":
+                    docker_path = dest
+                else:
+                    new_workspace[repo_key] = dest
+
+        self.workspace = new_workspace
+
+        port = self._find_free_port()
+        self._dynamic_workspace_port = port
+
+        env_lines = [
+            f"KANTA_LAB_PORT={port}",
+            "KANTA_LAB_API_PATH=",
+            "KANTA_LAB_FRONT_PATH=",
+        ]
+        for repo_key, path in new_workspace.items():
+            env_var = self._docker_env_mapping.get(repo_key)
+            if env_var:
+                env_lines.append(f"{env_var}={path}")
+
+        for token in ("NPM_TOKEN", "FONTAWESOME_PACKAGE_TOKEN", "REVERB_APP_KEY"):
+            val = os.environ.get(token, "")
+            if not val:
+                logger.warning("Forge %s: token %s not set in environment", self.name, token)
+            env_lines.append(f"{token}={val}")
+
+        if docker_path:
+            env_path = os.path.join(docker_path, ".env")
+            with open(env_path, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(env_lines) + "\n")
+            logger.info("Forge %s: wrote kanta-docker .env at %s (port=%d)", self.name, env_path, port)
+
+        self.state["dynamic_workspace"] = {
+            "dir": run_dir,
+            "port": port,
+            "repos": list(new_workspace.keys()),
+            "docker_path": docker_path,
+        }
+        self._save_state()
+
+        repos_str = ", ".join(new_workspace.keys())
+        await self.bus.publish(Message(
+            source="forge",
+            content=(
+                f"✅ **Forge {self.name}** — Dynamic workspace ready\n"
+                f"  📂 `{run_dir}`\n"
+                f"  🔌 Port: {port}\n"
+                f"  📦 Repos: {repos_str}\n"
+                f"  🐳 Docker: `{docker_path}`"
+            ),
+            level="info",
+            forge_name=self.name,
+        ))
+
+    async def _cleanup_dynamic_workspace(self) -> None:
+        if not self._dynamic_workspace_dir:
+            return
+        dir_to_remove = self._dynamic_workspace_dir
+        self._dynamic_workspace_dir = None
+        self._dynamic_workspace_port = None
+        self.workspace = dict(self._original_workspace)
+        self.state.pop("dynamic_workspace", None)
+        self._save_state()
+        try:
+            shutil.rmtree(dir_to_remove, ignore_errors=True)
+            logger.info("Forge %s: cleaned up dynamic workspace %s", self.name, dir_to_remove)
+            await self.bus.publish(Message(
+                source="forge",
+                content=f"🧹 **Forge {self.name}** — Dynamic workspace cleaned: `{dir_to_remove}`",
+                level="info",
+                forge_name=self.name,
+            ))
+        except Exception as exc:
+            logger.warning("Forge %s: dynamic workspace cleanup failed: %s", self.name, exc)
+
+    def _cleanup_dynamic_workspace_sync(self) -> None:
+        if not self._dynamic_workspace_dir:
+            return
+        dir_to_remove = self._dynamic_workspace_dir
+        self._dynamic_workspace_dir = None
+        self._dynamic_workspace_port = None
+        self.workspace = dict(self._original_workspace)
+        self.state.pop("dynamic_workspace", None)
+        shutil.rmtree(dir_to_remove, ignore_errors=True)
+        logger.info("Forge %s: sync cleaned up dynamic workspace %s", self.name, dir_to_remove)
+
+    # ------------------------------------------------------------------
+    # Git worktree management
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_git_repo(path: str) -> bool:
+        """True if `path` is a git working tree.
+
+        `.git` is a *directory* in a normal clone but a *file* (`gitdir: ...`)
+        in a linked worktree. `os.path.isdir` misses worktrees — which silently
+        broke git_prepare/git_finalize for worktree-based forges (no branch,
+        no push, no warning). `os.path.exists` accepts both.
+        """
+        return bool(path) and os.path.exists(os.path.join(path, ".git"))
+
     def _worktree_paths_active(self) -> bool:
         if not self.use_git_worktree or not self._original_workspace or not self.workspace:
             return False
@@ -960,6 +1190,8 @@ class Forge:
 
     async def _ensure_git_worktrees(self) -> None:
         """One isolated worktree per main clone under .dispatch-worktrees/issues/<id>/."""
+        if self._dynamic_workspace_dir:
+            return
         if not self.use_git_worktree or self._worktree_paths_active():
             return
 
@@ -973,11 +1205,19 @@ class Forge:
             return
         jira_id = jira_m.group(1)
         if not self._original_workspace:
-            return
+            raise RuntimeError(
+                f"Forge {self.name}: git_worktree actif mais aucun workspace resolu "
+                f"(base_env du workspace_group absent ou vide ?)."
+            )
 
         first_main = next(iter(self._original_workspace.values()), "")
-        if not first_main or not os.path.isdir(os.path.join(first_main, ".git")):
-            return
+        if not self._is_git_repo(first_main):
+            base_hint = os.path.dirname(os.path.normpath(first_main)) if first_main else "?"
+            raise RuntimeError(
+                f"Forge {self.name}: git_worktree actif mais le clone source est introuvable "
+                f"({first_main or '?'} n'est pas un depot git). Verifiez que `{base_hint}` "
+                f"existe et contient les clones du workspace_group avant de lancer le workflow."
+            )
         base_path = os.path.dirname(os.path.normpath(first_main))
         # Use `<jira_id>-<title-slug>` for the worktree folder (matches issue dir).
         folder_name = self._jira_folder_name() or jira_id
@@ -986,7 +1226,7 @@ class Forge:
         self._worktree_registry.clear()
 
         for repo_name, main_path in self._original_workspace.items():
-            if not os.path.isdir(os.path.join(main_path, ".git")):
+            if not self._is_git_repo(main_path):
                 continue
             st = await self._git_exec(
                 main_path, "status", "--porcelain", "--untracked-files=no", timeout=30,
@@ -1179,8 +1419,10 @@ class Forge:
         task_str = self.state.get("task") or ""
         jira_match = self._JIRA_RE.search(task_str)
         if not jira_match:
-            logger.warning("Forge %s: no JIRA ID, skipping git prepare", self.name)
-            return
+            raise RuntimeError(
+                f"Forge {self.name}: /{skill_name} demande git_prepare mais aucun ID ticket "
+                f"(ex. KAN-123) n'a ete trouve dans la tache; impossible de creer la branche feature."
+            )
         jira_id = jira_match.group(1)
 
         affected = self._get_affected_repos()
@@ -1188,7 +1430,7 @@ class Forge:
         # Collect repos to prepare
         repos_to_prepare: List[tuple] = []
         for repo_name, repo_path in self.workspace.items():
-            if not os.path.isdir(os.path.join(repo_path, ".git")):
+            if not self._is_git_repo(repo_path):
                 continue
             if affected and repo_name not in affected:
                 logger.info("Repo %s: not in plan, skipping", repo_name)
@@ -1196,7 +1438,11 @@ class Forge:
             repos_to_prepare.append((repo_name, repo_path))
 
         if not repos_to_prepare:
-            return
+            raise RuntimeError(
+                f"Forge {self.name}: /{skill_name} demande git_prepare mais aucun depot git "
+                f"n'a ete trouve dans le workspace. Verifiez le base_env du workspace_group "
+                f"(repos attendus: {', '.join(self.workspace.keys()) or 'aucun'})."
+            )
 
         # Prepare all repos in parallel
         results = await asyncio.gather(
@@ -1293,7 +1539,7 @@ class Forge:
                 mr_description = plan_data["summary"]
 
         for repo_name, repo_path in self.workspace.items():
-            if not os.path.isdir(os.path.join(repo_path, ".git")):
+            if not self._is_git_repo(repo_path):
                 continue
 
             # Check current branch
@@ -1525,6 +1771,16 @@ class Forge:
 
         # Determine cwd: use first affected repo, or first workspace repo
         run_cwd = self._resolve_run_cwd()
+
+        # Fail loud: a step with git side effects must run inside a real repo.
+        # Without a valid cwd the agent runs rootless and may *claim* it committed
+        # while touching nothing — silently producing no branch, commit, or push.
+        if run_cwd is None and (skill.get("git_prepare") or skill.get("git_finalize")):
+            raise RuntimeError(
+                f"Forge {self.name}: /{skill_name} a des effets git mais aucun repo de travail "
+                f"valide n'a ete resolu (cwd introuvable). L'agent ne sera pas lance a vide. "
+                f"Verifiez le workspace de la forge (base_env du workspace_group)."
+            )
 
         logger.info("Forge %s: starting skill /%s (runner=%s, timeout=%ds, cwd=%s)",
                      self.name, skill_name, runner_name, skill_timeout,
@@ -1807,6 +2063,24 @@ class Forge:
                     forge_name=self.name,
                 ))
         finally:
+            if self.dynamic_workspace:
+                if self.state.get("status") == "completed":
+                    await self._cleanup_dynamic_workspace()
+                elif self._dynamic_workspace_dir:
+                    logger.warning(
+                        "Forge %s: preserving dynamic workspace %s (status=%s) — commits may exist",
+                        self.name, self._dynamic_workspace_dir, self.state.get("status"),
+                    )
+                    await self.bus.publish(Message(
+                        source="forge",
+                        content=(
+                            f"⚠️ **Forge {self.name}** — Workspace preserved (workflow did not complete):\n"
+                            f"  📂 `{self._dynamic_workspace_dir}`\n"
+                            f"  Use `!{self.name} reset` to clean up manually."
+                        ),
+                        level="warning",
+                        forge_name=self.name,
+                    ))
             if self.use_git_worktree and self.state.get("status") == "completed":
                 await self._teardown_git_worktrees()
 
@@ -1887,6 +2161,10 @@ class Forge:
 
             # Extract summary for context compression (inter-agent communication)
             self._store_step_summary(skill_name, output)
+
+            # Dynamic workspace provisioning: clone repos after analyze step
+            if self.dynamic_workspace and skill_name == "analyze":
+                await self._provision_dynamic_workspace()
 
             pass_condition = skill.get("pass_condition")
             if pass_condition:
@@ -2024,6 +2302,7 @@ class Forge:
     def reset(self) -> None:
         if self._running_task and not self._running_task.done():
             self._running_task.cancel()
+        self._cleanup_dynamic_workspace_sync()
         self._teardown_git_worktrees_sync()
         self.state = {
             "status": "idle",

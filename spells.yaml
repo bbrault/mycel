@@ -1,6 +1,66 @@
 spells:
 
   # ==================================================================
+  # Phase 0 — Workspace analysis (dynamic provisioning)
+  # ==================================================================
+
+  analyze:
+    command: /analyze
+    runner: claude
+    description: "Analyze task to determine required repos (workspace provisioning)"
+    auto_advance: true
+    timeout: 120
+    required_fields: [required_repos]
+    prompt: |
+      Tu es un **architecte technique** senior specialise dans la stack Kanta
+      (Laravel 11 + Nuxt 3 + kanta-ui + kanta-connector-system + kanta-database).
+
+      **Forge** : {forge_name}
+      **Tache JIRA** : {jira_id}
+
+      **Demande** :
+      {task}
+
+      **Instructions additionnelles** :
+      {instructions}
+
+      **Documentation issue (fichiers locaux)** :
+      {issue_context}
+
+      ## Repos disponibles
+
+      | Cle         | Repo                       | Description                                    |
+      |-------------|----------------------------|------------------------------------------------|
+      | api         | kanta-api-v2               | Laravel 11 backend (API REST)                  |
+      | front       | kanta-front-v2             | Nuxt 3 frontend                                |
+      | ui          | kanta-ui                   | Composants Vue 3 partages (design system)      |
+      | connector   | kanta-connector-system     | Connecteurs externes (SMTP, PDF, etc.)         |
+      | database    | kanta-database             | Migrations et models Eloquent partages         |
+      | basique-api | basique-api                | API client simplifie                           |
+
+      ## Ta mission
+
+      Analyse la demande pour determiner quels repos seront necessaires
+      pour l'implementation. Sois precis — chaque repo clone prend du temps
+      et de l'espace disque.
+
+      Regles :
+      - `api` + `front` est le combo le plus courant (feature full-stack)
+      - `database` est necessaire si des migrations ou models partages sont impliques
+      - `ui` est necessaire si des composants partages doivent etre crees ou modifies
+      - `connector` est necessaire si des connecteurs externes sont impliques
+      - En cas de doute, inclus le repo (mieux vaut trop que pas assez)
+
+      Reponds UNIQUEMENT en JSON valide :
+      ```json
+      {{
+        "required_repos": ["api", "front"],
+        "rationale": "Explication courte de pourquoi ces repos sont necessaires",
+        "summary": "Resume en 1 phrase"
+      }}
+      ```
+
+  # ==================================================================
   # Phase 1 — Analyse fonctionnelle
   # ==================================================================
 
@@ -268,8 +328,8 @@ spells:
     next_on_pass: tech-review
     next_on_fail: null
     pass_condition: null
-    post_run: "cd {workspace_first} && (composer test --no-interaction 2>&1 || true) | tail -80; echo '---'; (npx vitest run --reporter=verbose 2>&1 || true) | tail -80"
-    post_run_timeout: 900
+    post_run: "cd {workspace_first} && { [ -f composer.json ] && { (composer test --no-interaction 2>&1 || true) | tail -80; } || echo '(skip composer: no composer.json)'; }; echo '---'; { { [ -f vitest.config.ts ] || [ -f vitest.config.js ] || [ -f vitest.config.mjs ] || { [ -f package.json ] && grep -q vitest package.json; }; } && { (npx --no-install vitest run --reporter=verbose 2>&1 || true) | tail -80; } || echo '(skip vitest: not configured)'; }"
+    post_run_timeout: 600
     timeout: 1800
     git_prepare: true
     prompt: |
