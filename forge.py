@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import glob as globmod
 import hashlib
@@ -105,58 +106,78 @@ def resolve_issue_context(jira_id: str, docs_path: str, workspace: Dict[str, str
 # Safe condition evaluator (replaces eval())
 # ------------------------------------------------------------------
 
-_OPERATORS: Dict[str, Callable[[Any, Any], bool]] = {
-    "==": operator.eq,
-    "!=": operator.ne,
-    ">=": operator.ge,
-    "<=": operator.le,
-    ">": operator.gt,
-    "<": operator.lt,
+_OPERATORS: Dict[type, Callable[[Any, Any], bool]] = {
+    ast.Eq: operator.eq,
+    ast.NotEq: operator.ne,
+    ast.GtE: operator.ge,
+    ast.LtE: operator.le,
+    ast.Gt: operator.gt,
+    ast.Lt: operator.lt,
 }
 
+_MISSING = object()
 
-def _safe_evaluate_single(condition: str, data: Dict[str, Any]) -> bool:
-    """Evaluate a single comparison like ``verdict == 'approved'``."""
-    for op_str in sorted(_OPERATORS, key=len, reverse=True):
-        if op_str not in condition:
-            continue
-        parts = condition.split(op_str, 1)
-        if len(parts) != 2:
-            continue
-        left_key = parts[0].strip()
-        right_raw = parts[1].strip().strip("'\"")
 
-        left_val = data.get(left_key)
-        if left_val is None:
+def _compare(op_fn: Callable[[Any, Any], bool], left: Any, right: Any) -> bool:
+    """Compare two values, preferring numeric comparison, falling back to string."""
+    try:
+        left_num = left if isinstance(left, (int, float)) else float(left)
+        right_num = right if isinstance(right, (int, float)) else float(right)
+        return bool(op_fn(left_num, right_num))
+    except (ValueError, TypeError):
+        return bool(op_fn(str(left), str(right)))
+
+
+def _resolve_operand(node: ast.AST, data: Dict[str, Any]) -> Any:
+    """Resolve a leaf node: a field name (looked up in ``data``) or a literal."""
+    if isinstance(node, ast.Name):
+        return data.get(node.id, _MISSING)
+    if isinstance(node, ast.Constant):
+        return node.value
+    raise ValueError(f"unsupported operand: {type(node).__name__}")
+
+
+def _eval_node(node: ast.AST, data: Dict[str, Any]) -> bool:
+    """Recursively evaluate a boolean-expression AST against ``data``.
+
+    Handles parentheses and arbitrarily nested ``and`` / ``or`` / ``not`` —
+    precedence comes for free from Python's own parser.
+    """
+    if isinstance(node, ast.BoolOp):
+        results = [_eval_node(value, data) for value in node.values]
+        return all(results) if isinstance(node.op, ast.And) else any(results)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        return not _eval_node(node.operand, data)
+    if isinstance(node, ast.Compare):
+        if len(node.ops) != 1:
+            raise ValueError("chained comparisons are not supported")
+        op_fn = _OPERATORS.get(type(node.ops[0]))
+        if op_fn is None:
+            raise ValueError(f"unsupported operator: {type(node.ops[0]).__name__}")
+        left = _resolve_operand(node.left, data)
+        right = _resolve_operand(node.comparators[0], data)
+        # A field absent from the data makes its comparison False (legacy behavior).
+        if left is _MISSING or right is _MISSING or left is None:
             return False
-
-        # Numeric comparison
-        try:
-            left_num = float(left_val) if not isinstance(left_val, (int, float)) else left_val
-            right_num = float(right_raw)
-            return _OPERATORS[op_str](left_num, right_num)
-        except (ValueError, TypeError):
-            pass
-
-        # String comparison
-        return _OPERATORS[op_str](str(left_val), right_raw)
-
-    return False
+        return _compare(op_fn, left, right)
+    raise ValueError(f"unsupported expression: {type(node).__name__}")
 
 
 def safe_evaluate_condition(condition: str, data: Dict[str, Any]) -> bool:
-    """Evaluate a condition with optional ``and`` / ``or`` connectors."""
-    if " and " in condition:
-        return all(
-            _safe_evaluate_single(part.strip(), data)
-            for part in condition.split(" and ")
-        )
-    if " or " in condition:
-        return any(
-            _safe_evaluate_single(part.strip(), data)
-            for part in condition.split(" or ")
-        )
-    return _safe_evaluate_single(condition, data)
+    """Evaluate a boolean condition string against ``data`` without ``eval``.
+
+    Supports field/literal comparisons (``==`` ``!=`` ``>=`` ``<=`` ``>`` ``<``)
+    combined with ``and`` / ``or`` / ``not`` and arbitrary parentheses, e.g.
+    ``(verdict == 'approved' or verdict == 'approved_with_reservations') and score >= 80``.
+    Numeric comparison is attempted first, falling back to string comparison.
+    Returns False on any unsupported or malformed expression.
+    """
+    try:
+        tree = ast.parse(condition, mode="eval")
+        return bool(_eval_node(tree.body, data))
+    except (SyntaxError, ValueError) as exc:
+        logger.warning("Invalid pass condition %r: %s", condition, exc)
+        return False
 
 
 # ------------------------------------------------------------------
