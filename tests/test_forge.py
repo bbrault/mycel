@@ -136,6 +136,31 @@ class TestSafeEvaluateCondition:
     def test_numeric_string_value(self) -> None:
         assert safe_evaluate_condition("score >= 70", {"score": "85"}) is True
 
+    # --- parenthesized / mixed-connector conditions (regression: arch-review gate) ---
+
+    def test_parenthesized_or_and_passes(self) -> None:
+        # The real arch-review / tech-review gate condition.
+        cond = "(verdict == 'approved' or verdict == 'approved_with_reservations') and score >= 80"
+        assert safe_evaluate_condition(cond, {"verdict": "approved", "score": 92}) is True
+
+    def test_parenthesized_or_and_second_branch(self) -> None:
+        cond = "(verdict == 'approved' or verdict == 'approved_with_reservations') and score >= 80"
+        assert safe_evaluate_condition(cond, {"verdict": "approved_with_reservations", "score": 80}) is True
+
+    def test_parenthesized_or_and_fails_on_score(self) -> None:
+        cond = "(verdict == 'approved' or verdict == 'approved_with_reservations') and score >= 80"
+        assert safe_evaluate_condition(cond, {"verdict": "approved", "score": 70}) is False
+
+    def test_parenthesized_or_and_fails_on_verdict(self) -> None:
+        cond = "(verdict == 'approved' or verdict == 'approved_with_reservations') and score >= 80"
+        assert safe_evaluate_condition(cond, {"verdict": "rejected", "score": 99}) is False
+
+    def test_not_operator(self) -> None:
+        assert safe_evaluate_condition("not verdict == 'rejected'", {"verdict": "approved"}) is True
+
+    def test_malformed_condition_returns_false(self) -> None:
+        assert safe_evaluate_condition("verdict == == 'approved'", {"verdict": "approved"}) is False
+
 
 # ------------------------------------------------------------------
 # Forge._build_prompt
