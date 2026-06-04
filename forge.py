@@ -119,17 +119,6 @@ _OPERATORS: Dict[type, Callable[[Any, Any], bool]] = {
 
 _MISSING = object()
 
-def _safe_evaluate_single(condition: str, data: Dict[str, Any]) -> bool:
-    """Evaluate a single comparison like ``verdict == 'approved'``."""
-    condition = condition.strip().strip("()")
-    for op_str in sorted(_OPERATORS, key=len, reverse=True):
-        if op_str not in condition:
-            continue
-        parts = condition.split(op_str, 1)
-        if len(parts) != 2:
-            continue
-        left_key = parts[0].strip()
-        right_raw = parts[1].strip().strip("'\"")
 
 def _compare(op_fn: Callable[[Any, Any], bool], left: Any, right: Any) -> bool:
     """Compare two values, preferring numeric comparison, falling back to string."""
@@ -177,36 +166,20 @@ def _eval_node(node: ast.AST, data: Dict[str, Any]) -> bool:
 
 
 def safe_evaluate_condition(condition: str, data: Dict[str, Any]) -> bool:
-    """Evaluate a condition with optional ``and`` / ``or`` connectors and parentheses."""
-    condition = condition.strip()
-    # Strip outer parentheses: "(X or Y)" → "X or Y"
-    while condition.startswith("(") and condition.endswith(")"):
-        # Only strip if the parens actually wrap the whole expression
-        depth, balanced = 0, True
-        for i, ch in enumerate(condition):
-            if ch == "(":
-                depth += 1
-            elif ch == ")":
-                depth -= 1
-            if depth == 0 and i < len(condition) - 1:
-                balanced = False
-                break
-        if balanced:
-            condition = condition[1:-1].strip()
-        else:
-            break
+    """Evaluate a boolean condition string against ``data`` without ``eval``.
 
-    if " and " in condition:
-        return all(
-            safe_evaluate_condition(part.strip(), data)
-            for part in condition.split(" and ")
-        )
-    if " or " in condition:
-        return any(
-            safe_evaluate_condition(part.strip(), data)
-            for part in condition.split(" or ")
-        )
-    return _safe_evaluate_single(condition, data)
+    Supports field/literal comparisons (``==`` ``!=`` ``>=`` ``<=`` ``>`` ``<``)
+    combined with ``and`` / ``or`` / ``not`` and arbitrary parentheses, e.g.
+    ``(verdict == 'approved' or verdict == 'approved_with_reservations') and score >= 80``.
+    Numeric comparison is attempted first, falling back to string comparison.
+    Returns False on any unsupported or malformed expression.
+    """
+    try:
+        tree = ast.parse(condition, mode="eval")
+        return bool(_eval_node(tree.body, data))
+    except (SyntaxError, ValueError) as exc:
+        logger.warning("Invalid pass condition %r: %s", condition, exc)
+        return False
 
 
 # ------------------------------------------------------------------
