@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "mycel": {
+      "command": "python3",
+      "args": ["mycel_mcp_server.py"],
+      "env": {
+        "MYCEL_CONTROL_SOCKET": "${MYCEL_CONTROL_SOCKET}"
+      }
+    }
+  }
+}

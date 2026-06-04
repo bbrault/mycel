@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
+from control_server import ControlServer
 from forge import Forge
 from message_bus import Message, MessageBus
 from runner import check_runners
@@ -77,6 +78,7 @@ class Mycel:
         self.claude_config: Dict[str, Any] = {}
         self.forges: Dict[str, Forge] = {}
         self.bus = MessageBus(bus_dir=bus_dir)
+        self.control_server = ControlServer(self, bus_dir=bus_dir)
         self.familiar_status: Dict[str, bool] = {}
         self.sentry_monitor: Optional[SentryMonitor] = None
         self.aikido_monitor: Optional[AikidoMonitor] = None
@@ -477,6 +479,11 @@ class Mycel:
     @property
     def queue_size(self) -> int:
         return sum(q.qsize() for q in self._forge_queues.values())
+
+    @property
+    def control_socket_path(self) -> str:
+        """Path to the ControlServer Unix socket the concierge MCP server connects to."""
+        return self.control_server.socket_path
 
     # ------------------------------------------------------------------
     # Commands

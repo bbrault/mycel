@@ -56,6 +56,15 @@ claude:
   allowed_tools: "mcp__claude_ai_Atlassian__*,mcp__claude_ai_Notion__*,mcp__claude_ai_Figma__*,mcp__claude_ai_Sentry__*,mcp__claude_ai_Slack__*,mcp__claude_ai_Aikido__*"
   permission_mode: "auto"
 
+# Conversational concierge (talk to Mycel in natural language via @mention)
+# Phase 1: read-only tools only (mcp__mycel__*). See mycel_mcp_server.py.
+agent:
+  enabled: true
+  timeout: 120
+  allowed_tools: "mcp__mycel__*"
+  permission_mode: auto
+  mcp_config: mycel_mcp.json
+
 # Sentry monitoring
 sentry_monitor:
   enabled: true

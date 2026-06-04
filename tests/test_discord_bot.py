@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import os
 import sys
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from discord_bot import chunk_message
+from discord_bot import MycelBot, chunk_message
 
 
 class TestChunkMessage:
@@ -43,3 +47,67 @@ class TestChunkMessage:
         # Reassemble should give back original content (minus stripped newlines)
         reassembled = "\n".join(chunks)
         assert "line" in reassembled
+
+
+class _Typing:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+def _fake_message(content, mentions, channel):
+    return SimpleNamespace(
+        author=object(),
+        content=content,
+        mentions=mentions,
+        channel=channel,
+        add_reaction=AsyncMock(),
+    )
+
+
+class TestOnMessageRouting:
+    """on_message is exercised with a fake `self` so no real bot/Discord is needed."""
+
+    @pytest.mark.asyncio
+    async def test_mention_routes_to_concierge(self) -> None:
+        user = SimpleNamespace(id=42)
+        channel = SimpleNamespace(id=777, typing=lambda: _Typing(), send=AsyncMock())
+        concierge = SimpleNamespace(handle_message=AsyncMock(return_value="dev is idle."))
+        bot = SimpleNamespace(
+            user=user,
+            concierge=concierge,
+            _send_to_target=AsyncMock(),
+        )
+        msg = _fake_message("<@42> what's up with dev?", [user], channel)
+
+        await MycelBot.on_message(bot, msg)
+
+        concierge.handle_message.assert_awaited_once_with("777", "what's up with dev?")
+        bot._send_to_target.assert_awaited_once_with("dev is idle.", channel)
+
+    @pytest.mark.asyncio
+    async def test_freeform_in_forge_thread_still_injects_feedback(self) -> None:
+        user = SimpleNamespace(id=42)
+        thread = SimpleNamespace(id=555)
+        channel = thread  # message posted in the forge thread
+        forge = SimpleNamespace(name="dev", state={"status": "running"})
+        orchestrator = SimpleNamespace(
+            forges={"dev": forge},
+            inject_feedback=MagicMock(),
+            task_running=True,
+        )
+        bot = SimpleNamespace(
+            user=user,
+            concierge=SimpleNamespace(handle_message=AsyncMock()),
+            orchestrator=orchestrator,
+            _forge_threads={"dev": thread},
+            _channels={},
+        )
+        msg = _fake_message("please also handle edge cases", [], channel)
+
+        await MycelBot.on_message(bot, msg)
+
+        orchestrator.inject_feedback.assert_called_once_with("dev", "please also handle edge cases")
+        bot.concierge.handle_message.assert_not_awaited()

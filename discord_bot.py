@@ -9,6 +9,7 @@ from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
+from concierge import Concierge
 from forge import extract_json
 from mycel import Mycel
 from message_bus import Message
@@ -317,6 +318,7 @@ class MycelBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
         self.orchestrator = Mycel()
+        self.concierge = Concierge(self.orchestrator, self.orchestrator.config.get("agent", {}))
         # Multi-channel support: channel_name -> TextChannel
         self._channels: Dict[str, discord.TextChannel] = {}
         # Active thread per forge run: forge_name -> Thread
@@ -334,6 +336,7 @@ class MycelBot(commands.Bot):
     async def setup_hook(self) -> None:
         self.orchestrator.bus.subscribe(self._on_bus_message)
         await self.orchestrator.bus.start()
+        await self.orchestrator.control_server.start()
         await self.orchestrator.start_worker()
         await self.orchestrator.start_sentry_monitor()
         await self.orchestrator.start_aikido_monitor()
@@ -823,6 +826,21 @@ class MycelBot(commands.Bot):
 
     async def on_message(self, message: discord.Message) -> None:
         if message.author == self.user:
+            return
+
+        # @Mycel mention (any channel) → conversational concierge.
+        # Checked before everything else; a direct user-mention never fires on
+        # @everyone/role pings, so the in-thread feedback path below is untouched.
+        if self.user in message.mentions and not message.content.startswith("!"):
+            text = message.content.replace(f"<@{self.user.id}>", "").replace(f"<@!{self.user.id}>", "").strip()
+            if text:
+                try:
+                    async with message.channel.typing():
+                        reply = await self.concierge.handle_message(str(message.channel.id), text)
+                    await self._send_to_target(reply, message.channel)
+                except Exception as exc:
+                    logger.error("Concierge error: %s", exc, exc_info=True)
+                    await message.channel.send(f"❌ Concierge error: {exc}")
             return
 
         if message.content.startswith("!"):
