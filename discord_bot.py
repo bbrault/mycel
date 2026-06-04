@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Any, Dict, List, Optional, Union
 
 import discord
@@ -21,6 +22,10 @@ logger = logging.getLogger("mycel.discord")
 DISCORD_TOKEN: str = os.getenv("DISCORD_BOT_TOKEN", "")
 DEFAULT_CHANNEL = "agents"
 CHUNK_SIZE = 1900
+
+# Text fallback for the concierge when users type the name instead of using a
+# real Discord mention: a leading "@mycel" / "mycel" (optionally ",:" then space).
+_CONCIERGE_PREFIX = re.compile(r"^\s*@?mycel\b[\s,:]*", re.IGNORECASE)
 
 
 def chunk_message(text: str) -> list[str]:
@@ -828,19 +833,27 @@ class MycelBot(commands.Bot):
         if message.author == self.user:
             return
 
-        # @Mycel mention (any channel) → conversational concierge.
-        # Checked before everything else; a direct user-mention never fires on
-        # @everyone/role pings, so the in-thread feedback path below is untouched.
-        if self.user in message.mentions and not message.content.startswith("!"):
-            text = message.content.replace(f"<@{self.user.id}>", "").replace(f"<@!{self.user.id}>", "").strip()
-            if text:
-                try:
-                    async with message.channel.typing():
-                        reply = await self.concierge.handle_message(str(message.channel.id), text)
-                    await self._send_to_target(reply, message.channel)
-                except Exception as exc:
-                    logger.error("Concierge error: %s", exc, exc_info=True)
-                    await message.channel.send(f"❌ Concierge error: {exc}")
+        # @Mycel (any channel) → conversational concierge. Checked before
+        # everything else. Triggers on either a real Discord mention (detected
+        # by id — ClientUser vs Member object identity is unreliable) OR a
+        # literal "@mycel ..." / "mycel, ..." text prefix, so users who type the
+        # name instead of picking it from the autocomplete still get through.
+        content = message.content or ""
+        real_mention = self.user is not None and any(u.id == self.user.id for u in message.mentions)
+        text_trigger = _CONCIERGE_PREFIX.match(content) is not None
+        if (real_mention or text_trigger) and not content.startswith("!"):
+            text = content
+            if self.user is not None:
+                text = text.replace(f"<@{self.user.id}>", "").replace(f"<@!{self.user.id}>", "")
+            text = _CONCIERGE_PREFIX.sub("", text, count=1).strip()
+            logger.info("Concierge trigger (mention=%s) in channel %s: %r", real_mention, message.channel.id, text[:80])
+            try:
+                async with message.channel.typing():
+                    reply = await self.concierge.handle_message(str(message.channel.id), text or "hello")
+                await self._send_to_target(reply, message.channel)
+            except Exception as exc:
+                logger.error("Concierge error: %s", exc, exc_info=True)
+                await message.channel.send(f"❌ Concierge error: {exc}")
             return
 
         if message.content.startswith("!"):

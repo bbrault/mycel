@@ -88,6 +88,19 @@ class TestOnMessageRouting:
         bot._send_to_target.assert_awaited_once_with("dev is idle.", channel)
 
     @pytest.mark.asyncio
+    async def test_text_prefix_triggers_concierge(self) -> None:
+        # User types "@Mycel ..." as plain text (no real mention) — must still route.
+        user = SimpleNamespace(id=42)
+        channel = SimpleNamespace(id=888, typing=lambda: _Typing(), send=AsyncMock())
+        concierge = SimpleNamespace(handle_message=AsyncMock(return_value="here you go"))
+        bot = SimpleNamespace(user=user, concierge=concierge, _send_to_target=AsyncMock())
+        msg = _fake_message("@Mycel list the forges", [], channel)  # mentions empty
+
+        await MycelBot.on_message(bot, msg)
+
+        concierge.handle_message.assert_awaited_once_with("888", "list the forges")
+
+    @pytest.mark.asyncio
     async def test_freeform_in_forge_thread_still_injects_feedback(self) -> None:
         user = SimpleNamespace(id=42)
         thread = SimpleNamespace(id=555)
