@@ -610,8 +610,8 @@ spells:
     description: "Create a JIRA ticket referencing the Sentry/Aikido issue"
     auto_advance: true
     next_on_pass: fix
-    next_on_fail: null
-    pass_condition: null
+    next_on_fail: null          # deja pris en charge → on s'arrete, pas de remediation en double
+    pass_condition: "already_claimed == False"
     required_fields: [jira_id, summary]
     timeout: 300
     runner_kwargs:
@@ -632,14 +632,27 @@ spells:
 
       ## Ta mission
 
-      1. **Idempotence** : si le titre / la description contient deja un identifiant
-         JIRA existant (ex: `KAN-1234`), NE CREE PAS de doublon — recupere le ticket
-         existant via `mcp__claude_ai_Atlassian__getJiraIssue` et renvoie ses infos
-         avec `created: false`.
-      2. **Contexte** : enrichis le ticket en allant chercher le detail de l'incident :
-         - Sentry → `mcp__claude_ai_Sentry__search_issues` puis `get_sentry_resource`
-           pour la stacktrace, frequence, premiere/derniere occurrence, environnement.
+      1. **Detail source** : recupere l'incident et son etat actuel.
+         - Sentry → `mcp__claude_ai_Sentry__search_issues` / `get_sentry_resource`
+           pour la stacktrace, frequence, premiere/derniere occurrence, environnement,
+           ET le champ **assignedTo** (qui s'en occupe deja).
          - Aikido → `mcp__claude_ai_Aikido__*` pour les findings de securite.
+
+      2. **Anti-collision / claim** (eviter qu'un collegue traite la meme issue) :
+         a. Si l'issue Sentry est **deja assignee a quelqu'un** (assignedTo non vide),
+            ou si une recherche JQL (`searchJiraIssuesUsingJql`, ex.
+            `labels = sentry AND text ~ "<source_id>" AND statusCategory != Done`)
+            trouve **un ticket ouvert** referencant cet ID source → quelqu'un la
+            traite deja : **N'AGIS PAS**. Renvoie `created: false`,
+            `already_claimed: true`, `claimed_by: "<assignee/ticket>"`, et
+            `summary: "Deja pris en charge par <...>"`.
+         b. Si la tache contient deja un ID JIRA existant → recupere-le via
+            `getJiraIssue`, renvoie `created: false` (pas de doublon).
+         c. Sinon, **claim immediatement, AVANT de creer le ticket** (minimise la
+            fenetre de course) : `mcp__claude_ai_Sentry__whoami` pour l'utilisateur
+            courant, puis `mcp__claude_ai_Sentry__update_issue` pour **assigner
+            l'issue Sentry a cet utilisateur** (= signal "pris" visible dans Sentry).
+
       3. **Creation** : appelle `mcp__claude_ai_Atlassian__createJiraIssue` dans le
          projet JIRA Kanta (par defaut `KAN`, sauf override en instructions) avec :
          - **Issue Type** : Bug
@@ -651,8 +664,12 @@ spells:
            - Section "References" avec l'ID source brut
          - **Priority** : derive de la severite — fatal/critical → Highest, error/high → High, warning/medium → Medium, info/low → Low
          - **Labels** : `sentry` ou `aikido` selon la source, plus `auto-created`
+         Puis **assigne le ticket JIRA** au meme utilisateur courant
+         (`editJiraIssue` assignee), pour une attribution coherente Sentry ↔ JIRA.
 
       ## IMPORTANT
+      - Le **claim** (etape 2c) prime : tente l'assignation Sentry meme si la
+        creation JIRA echoue ensuite.
       - Si la creation JIRA echoue (auth, projet introuvable, etc.), renvoie
         `created: false` avec l'erreur dans `summary` — ne bloque PAS la suite
         du ritual : la forge continue avec le contexte source initial.
@@ -668,7 +685,10 @@ spells:
         "source_url": "...",
         "priority": "Highest|High|Medium|Low",
         "created": true,
-        "summary": "Resume du ticket cree (ou de l'erreur si created=false)"
+        "already_claimed": false,
+        "claimed_by": "",
+        "assigned_to": "utilisateur courant assigne sur Sentry + JIRA",
+        "summary": "Resume du ticket cree (ou raison si created=false / already_claimed)"
       }}
 
   diagnose:
