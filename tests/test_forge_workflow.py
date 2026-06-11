@@ -712,6 +712,36 @@ class TestHookQuoting:
             await circle.bus.stop()
 
 
+class TestAbortStatus:
+    """Abort moves to a distinct `aborted` status, not `paused`."""
+
+    def test_abort_running_sets_aborted_status(self) -> None:
+        tmp = tempfile.mkdtemp()
+        circle = _make_circle(tmp, ["step-a"], SIMPLE_SKILLS)
+        circle.state["status"] = "running"
+        circle.state["current_skill"] = "step-a"
+        assert circle.abort() is True
+        assert circle.state["status"] == "aborted"
+        assert circle.state["aborted_at_skill"] == "step-a"
+
+    def test_abort_when_not_running_is_noop(self) -> None:
+        tmp = tempfile.mkdtemp()
+        circle = _make_circle(tmp, ["step-a"], SIMPLE_SKILLS)
+        circle.state["status"] = "paused"
+        assert circle.abort() is False
+        assert circle.state["status"] == "paused"
+
+    def test_reset_clears_aborted_state(self) -> None:
+        tmp = tempfile.mkdtemp()
+        circle = _make_circle(tmp, ["step-a"], SIMPLE_SKILLS)
+        circle.state["status"] = "running"
+        circle.state["current_skill"] = "step-a"
+        circle.abort()
+        circle.reset()
+        assert circle.state["status"] == "idle"
+        assert circle.state.get("aborted_at_skill") is None
+
+
 class TestHookTimeout:
     """Hooks (pre_run/post_run) must kill leaked subprocesses on timeout."""
 

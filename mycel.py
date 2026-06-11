@@ -102,38 +102,24 @@ class Mycel:
         """Read `forges:` from config, falling back to legacy `circles:`."""
         return self.config.get("forges", self.config.get("circles", {})) or {}
 
-    def _load_config(self) -> None:
+    def _parse_config_file(self) -> Dict[str, Any]:
+        """Read + parse the config YAML. Pure: returns a dict, mutates nothing."""
         with open(self.config_path, "r", encoding="utf-8") as fh:
-            self.config = yaml.safe_load(fh)
+            return yaml.safe_load(fh) or {}
 
-        self.docs_path = os.path.expanduser(os.environ.get("DOCS_PATH", self.config.get("docs_path", "")))
-        self.issues_dir = os.path.expanduser(os.environ.get("ISSUES_DIR", self.config.get("issues_dir", "")))
+    def _parse_spells_file(self) -> Dict[str, Dict[str, Any]]:
+        """Read + parse the spells YAML, resolving external prompt files.
 
-        self._repo_folders: Dict[str, str] = self.config.get("repos", {})
-        self._workspace_groups: Dict[str, Dict[str, Any]] = self.config.get("workspace_groups", {})
-
-        self.workspace = {}
-        for group_cfg in self._workspace_groups.values():
-            base_env = group_cfg.get("base_env", "")
-            base_path = os.path.expanduser(os.environ.get(base_env, ""))
-            if not base_path:
-                continue
-            for repo_key in group_cfg.get("repos", []):
-                folder = self._repo_folders.get(repo_key, repo_key)
-                if repo_key not in self.workspace:
-                    self.workspace[repo_key] = os.path.join(base_path, folder)
-
-        self.claude_config = self.config.get("claude", {})
-        logger.info("Loaded config from %s (%d forges, %d repos)", self.config_path, len(self._forges_section()), len(self._repo_folders))
-
-    def _load_spells(self) -> None:
+        Pure: builds and returns a fresh dict, mutates no instance state — so a
+        parse failure can't leave a half-built spells_config behind.
+        """
         with open(self.spells_path, "r", encoding="utf-8") as fh:
-            data = yaml.safe_load(fh)
+            data = yaml.safe_load(fh) or {}
         # Prefer `spells:`; fall back to legacy `skills:`
-        self.spells_config = data.get("spells", data.get("skills", {}))
+        spells = data.get("spells", data.get("skills", {})) or {}
 
         loaded_external = 0
-        for sp_name, sp in self.spells_config.items():
+        for sp_name, sp in spells.items():
             prompt_file = sp.get("prompt_file")
             if prompt_file:
                 prompt_file = os.path.expanduser(prompt_file)
@@ -152,26 +138,74 @@ class Mycel:
                 else:
                     logger.warning("prompt_file not found for spell %s: %s", sp_name, prompt_file)
 
-        logger.info("Loaded spells from %s (%d spells, %d external prompts)", self.spells_path, len(self.spells_config), loaded_external)
+        logger.info("Loaded spells from %s (%d spells, %d external prompts)", self.spells_path, len(spells), loaded_external)
+        return spells
+
+    def _apply_config(self, config: Dict[str, Any]) -> None:
+        """Commit a parsed config dict to instance state and derive lookups."""
+        self.config = config
+        self.docs_path = os.path.expanduser(os.environ.get("DOCS_PATH", self.config.get("docs_path", "")))
+        self.issues_dir = os.path.expanduser(os.environ.get("ISSUES_DIR", self.config.get("issues_dir", "")))
+
+        self._repo_folders: Dict[str, str] = self.config.get("repos", {})
+        self._workspace_groups: Dict[str, Dict[str, Any]] = self.config.get("workspace_groups", {})
+
+        workspace: Dict[str, str] = {}
+        for group_cfg in self._workspace_groups.values():
+            base_env = group_cfg.get("base_env", "")
+            base_path = os.path.expanduser(os.environ.get(base_env, ""))
+            if not base_path:
+                continue
+            for repo_key in group_cfg.get("repos", []):
+                folder = self._repo_folders.get(repo_key, repo_key)
+                if repo_key not in workspace:
+                    workspace[repo_key] = os.path.join(base_path, folder)
+        self.workspace = workspace
+
+        self.claude_config = self.config.get("claude", {})
+        logger.info("Loaded config from %s (%d forges, %d repos)", self.config_path, len(self._forges_section()), len(self._repo_folders))
+
+    def _load_config(self) -> None:
+        self._apply_config(self._parse_config_file())
+
+    def _load_spells(self) -> None:
+        self.spells_config = self._parse_spells_file()
 
     def reload_config(self) -> str:
-        """Hot-reload config and spells without losing in-memory forge state."""
+        """Hot-reload config and spells without losing in-memory forge state.
+
+        Transactional: both files are parsed into temporaries *before* any live
+        state is touched, so a malformed YAML leaves the running config intact.
+        Forges that are mid-workflow (running/paused) keep the spell definitions
+        they started with — swapping under them could KeyError on a removed step;
+        they pick up the new spells on their next run.
+        """
         try:
-            self._load_config()
-            self._load_spells()
-
-            for forge in self.forges.values():
-                forge.spells = self.spells_config
-
-            for forge_name in self._forges_section():
-                if forge_name not in self.forges:
-                    self._build_single_forge(forge_name)
-
-            self._check_familiars()
-            return f"Config reloaded: {len(self.spells_config)} spells, {len(self.forges)} forges"
+            new_config = self._parse_config_file()
+            new_spells = self._parse_spells_file()
         except Exception as exc:
-            logger.error("Reload error: %s", exc)
-            return f"Reload error: {exc}"
+            logger.error("Reload error (config left unchanged): %s", exc)
+            return f"Reload error (config left unchanged): {exc}"
+
+        self._apply_config(new_config)
+        self.spells_config = new_spells
+
+        deferred: List[str] = []
+        for forge_name, forge in self.forges.items():
+            if forge.state.get("status") in ("running", "paused"):
+                deferred.append(forge_name)
+                continue
+            forge.spells = self.spells_config
+
+        for forge_name in self._forges_section():
+            if forge_name not in self.forges:
+                self._build_single_forge(forge_name)
+
+        self._check_familiars()
+        msg = f"Config reloaded: {len(self.spells_config)} spells, {len(self.forges)} forges"
+        if deferred:
+            msg += f" — spells kept for active forge(s) until idle: {', '.join(deferred)}"
+        return msg
 
     def _resolve_forge_workspace(self, forge_cfg: Dict[str, Any]) -> Dict[str, str]:
         """Resolve the workspace for a forge from its workspace_group."""
@@ -558,10 +592,22 @@ class Mycel:
         logger.info("Resume forge %s from /%s (position %d)", forge_name, from_spell, position)
         return position
 
+    @staticmethod
+    def _guard_not_aborted(forge: Forge, action: str) -> None:
+        """Refuse resume/retry on an aborted forge — its last step may be half-done."""
+        if forge.state.get("status") == "aborted":
+            at = forge.state.get("aborted_at_skill", "?")
+            raise ValueError(
+                f"Forge {forge.name} was aborted at /{at}. "
+                f"Cannot {action} — the step may be partially applied. "
+                f"Run `reset` to start fresh, or `from <step>` to restart from a chosen step."
+            )
+
     async def resume_forge(self, forge_name: str, instructions: Optional[str] = None) -> None:
         if forge_name not in self.forges:
             raise ValueError(f"Unknown forge: {forge_name}")
         forge = self.forges[forge_name]
+        self._guard_not_aborted(forge, "resume")
 
         # Active worker awaiting evt.wait() → just signal it
         running_task = forge._running_task
@@ -592,6 +638,7 @@ class Mycel:
         if forge_name not in self.forges:
             raise ValueError(f"Unknown forge: {forge_name}")
         forge = self.forges[forge_name]
+        self._guard_not_aborted(forge, "retry")
 
         running_task = forge._running_task
         if running_task is not None and not running_task.done():

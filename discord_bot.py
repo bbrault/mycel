@@ -164,7 +164,11 @@ class ForgeControlView(discord.ui.View):
     async def resume_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[type-arg]
         if not await _ensure_allowed(interaction, self.orchestrator.config, self.forge_name):
             return
-        await self.orchestrator.resume_forge(self.forge_name)
+        try:
+            await self.orchestrator.resume_forge(self.forge_name)
+        except ValueError as exc:
+            await interaction.response.send_message(f"⚠️ {exc}", ephemeral=True)
+            return
         await interaction.response.send_message(
             f"▶️ **Forge {self.forge_name}** → workflow resumed",
         )
@@ -174,7 +178,11 @@ class ForgeControlView(discord.ui.View):
     async def retry_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[type-arg]
         if not await _ensure_allowed(interaction, self.orchestrator.config, self.forge_name):
             return
-        await self.orchestrator.retry_forge(self.forge_name)
+        try:
+            await self.orchestrator.retry_forge(self.forge_name)
+        except ValueError as exc:
+            await interaction.response.send_message(f"⚠️ {exc}", ephemeral=True)
+            return
         await interaction.response.send_message(
             f"\U0001f504 **Forge {self.forge_name}** → current step retried",
         )
@@ -337,7 +345,11 @@ class ClaapDiscoveryView(discord.ui.View):
     async def resume_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[type-arg]
         if not await _ensure_allowed(interaction, self.orchestrator.config, self.forge_name):
             return
-        await self.orchestrator.resume_forge(self.forge_name)
+        try:
+            await self.orchestrator.resume_forge(self.forge_name)
+        except ValueError as exc:
+            await interaction.response.send_message(f"⚠️ {exc}", ephemeral=True)
+            return
         await interaction.response.send_message(
             f"▶️ **Forge {self.forge_name}** → workflow resumed",
         )
@@ -347,7 +359,11 @@ class ClaapDiscoveryView(discord.ui.View):
     async def retry_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[type-arg]
         if not await _ensure_allowed(interaction, self.orchestrator.config, self.forge_name):
             return
-        await self.orchestrator.retry_forge(self.forge_name)
+        try:
+            await self.orchestrator.retry_forge(self.forge_name)
+        except ValueError as exc:
+            await interaction.response.send_message(f"⚠️ {exc}", ephemeral=True)
+            return
         await interaction.response.send_message(
             f"\U0001f504 **Forge {self.forge_name}** → current step retried",
         )
@@ -817,7 +833,14 @@ class MycelBot(commands.Bot):
                 await self._send_to_target(msg, thread)
 
         elif action_lower == "resume":
-            if self.orchestrator.forges[forge_name].state["status"] != "paused":
+            status = self.orchestrator.forges[forge_name].state["status"]
+            if status == "aborted":
+                await channel.send(
+                    f"\U0001f6d1 **Forge {forge_name}** was aborted — cannot resume. "
+                    f"Use `!{forge_name} reset` or `!{forge_name} from <step>`."
+                )
+                return
+            if status != "paused":
                 await channel.send(f"⚒️ **Forge {forge_name}** is not paused.")
                 return
             await self.orchestrator.resume_forge(forge_name, instructions=args or None)
@@ -826,12 +849,23 @@ class MycelBot(commands.Bot):
         elif action_lower == "abort":
             aborted = self.orchestrator.abort_forge(forge_name)
             if aborted:
-                await channel.send(f"\U0001f6d1 **Forge {forge_name}** → current step aborted. Use `!{forge_name} from <step>` to continue.")
+                await channel.send(
+                    f"\U0001f6d1 **Forge {forge_name}** → current step aborted. "
+                    f"The step may be partially applied — use `!{forge_name} reset` to start fresh "
+                    f"or `!{forge_name} from <step>` to restart from a chosen step."
+                )
             else:
                 await channel.send(f"⚒️ **Forge {forge_name}** is not running.")
 
         elif action_lower == "retry":
-            if self.orchestrator.forges[forge_name].state["status"] not in ("paused", "failed", "error"):
+            status = self.orchestrator.forges[forge_name].state["status"]
+            if status == "aborted":
+                await channel.send(
+                    f"\U0001f6d1 **Forge {forge_name}** was aborted — cannot retry. "
+                    f"Use `!{forge_name} reset` or `!{forge_name} from <step>`."
+                )
+                return
+            if status not in ("paused", "failed", "error"):
                 await channel.send(f"⚒️ **Forge {forge_name}** is not paused or in error state.")
                 return
             await self.orchestrator.retry_forge(forge_name, instructions=args or None)

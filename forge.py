@@ -2271,15 +2271,23 @@ class Forge:
         self._ensure_resume_event().set()
 
     def abort(self) -> bool:
-        """Abort the currently running skill. Returns True if aborted, False if nothing to abort."""
+        """Abort the currently running skill. Returns True if aborted, False if nothing to abort.
+
+        Moves to the distinct ``aborted`` status (not ``paused``): the current
+        step may have been cancelled mid-side-effect (partial git commit, half
+        a file write), so a plain ``resume``/``retry`` is unsafe. The user must
+        explicitly ``reset`` or restart from a chosen step with ``from <step>``.
+        """
         if self.state.get("status") != "running":
             return False
+        aborted_skill = self.state.get("current_skill", "?")
         if self._running_task and not self._running_task.done():
             self._running_task.cancel()
-        self.state["status"] = "paused"
-        self.state["error"] = f"Avorte par l'utilisateur (skill /{self.state.get('current_skill', '?')})"
+        self.state["status"] = "aborted"
+        self.state["aborted_at_skill"] = aborted_skill
+        self.state["error"] = f"Avorte par l'utilisateur (skill /{aborted_skill})"
         self._save_state()
-        logger.info("Forge %s: abort requested", self.name)
+        logger.info("Forge %s: abort requested (at /%s)", self.name, aborted_skill)
         return True
 
     def reset(self) -> None:
@@ -2419,6 +2427,7 @@ class Forge:
         icon = {
             "running": "\U0001f7e2", "paused": "\U0001f7e1",
             "completed": "\U0001f535", "failed": "\U0001f534", "error": "\U0001f534",
+            "aborted": "\U0001f6d1",
         }.get(status, "\u26aa")
 
         current = s.get("current_skill", "") or ""
