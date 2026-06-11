@@ -11,7 +11,40 @@ import pytest
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from message_bus import Message, MessageBus
+from message_bus import Message, MessageBus, atomic_write_json
+
+
+class TestAtomicWriteJson:
+    def test_writes_valid_json(self) -> None:
+        tmp = tempfile.mkdtemp()
+        path = os.path.join(tmp, "state.json")
+        atomic_write_json(path, {"status": "idle", "n": 3})
+        with open(path, encoding="utf-8") as fh:
+            assert json.load(fh) == {"status": "idle", "n": 3}
+
+    def test_replaces_existing_file(self) -> None:
+        tmp = tempfile.mkdtemp()
+        path = os.path.join(tmp, "state.json")
+        atomic_write_json(path, {"v": 1})
+        atomic_write_json(path, {"v": 2})
+        with open(path, encoding="utf-8") as fh:
+            assert json.load(fh) == {"v": 2}
+
+    def test_no_tmp_file_left_behind(self) -> None:
+        tmp = tempfile.mkdtemp()
+        path = os.path.join(tmp, "state.json")
+        atomic_write_json(path, {"v": 1})
+        assert os.listdir(tmp) == ["state.json"]
+
+    def test_failed_write_keeps_previous_file(self) -> None:
+        tmp = tempfile.mkdtemp()
+        path = os.path.join(tmp, "state.json")
+        atomic_write_json(path, {"v": 1})
+        with pytest.raises(TypeError):
+            atomic_write_json(path, {"bad": object()})  # not JSON-serializable
+        with open(path, encoding="utf-8") as fh:
+            assert json.load(fh) == {"v": 1}
+        assert os.listdir(tmp) == ["state.json"]
 
 
 class TestMessage:

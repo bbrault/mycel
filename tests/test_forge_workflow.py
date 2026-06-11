@@ -683,6 +683,35 @@ class TestStatePersistence:
         assert saved["skill"] == "step-a"
 
 
+class TestHookQuoting:
+    """Discord-controlled template variables must be shell-quoted in hooks."""
+
+    @pytest.mark.asyncio
+    async def test_task_cannot_inject_shell_commands(self) -> None:
+        tmp = tempfile.mkdtemp()
+        circle = _make_circle(tmp, ["step-a"], SIMPLE_SKILLS)
+        circle.state["task"] = "x; echo PWNED"
+        await circle.bus.start()
+        try:
+            output = await circle._exec_hook("step-a", "pre_run", "echo {task}", timeout_s=5)
+            # Quoted: echo prints the whole task literally. Unquoted, the
+            # injected `echo PWNED` would run and print PWNED on its own line.
+            assert output.strip() == "x; echo PWNED"
+        finally:
+            await circle.bus.stop()
+
+    @pytest.mark.asyncio
+    async def test_empty_variables_stay_empty(self) -> None:
+        tmp = tempfile.mkdtemp()
+        circle = _make_circle(tmp, ["step-a"], SIMPLE_SKILLS)
+        await circle.bus.start()
+        try:
+            output = await circle._exec_hook("step-a", "pre_run", "echo [{mr_iid}]", timeout_s=5)
+            assert output.strip() == "[]"
+        finally:
+            await circle.bus.stop()
+
+
 class TestHookTimeout:
     """Hooks (pre_run/post_run) must kill leaked subprocesses on timeout."""
 

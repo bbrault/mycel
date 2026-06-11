@@ -9,6 +9,7 @@ import logging
 import operator
 import os
 import shutil
+import shlex
 import re
 import signal
 import socket
@@ -17,7 +18,7 @@ import tempfile
 import time
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple
 
-from message_bus import Message, MessageBus
+from message_bus import Message, MessageBus, atomic_write_json
 from runner import StreamCallback, get_runner
 
 logger = logging.getLogger("mycel.forge")
@@ -376,8 +377,7 @@ class Forge:
 
     def _save_state(self) -> None:
         os.makedirs(self._state_dir, exist_ok=True)
-        with open(self._state_path, "w", encoding="utf-8") as fh:
-            json.dump(self.state, fh, ensure_ascii=False, indent=2)
+        atomic_write_json(self._state_path, self.state)
 
     def _load_state(self) -> None:
         if os.path.exists(self._state_path):
@@ -405,21 +405,18 @@ class Forge:
         # Save to current state dir (overwritten each run)
         os.makedirs(self._state_dir, exist_ok=True)
         path = os.path.join(self._state_dir, f"skill_{skill_name}.json")
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, ensure_ascii=False, indent=2)
+        atomic_write_json(path, payload)
 
         # Save to versioned run dir (history)
         os.makedirs(self._run_dir, exist_ok=True)
         run_path = os.path.join(self._run_dir, f"skill_{skill_name}.json")
-        with open(run_path, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, ensure_ascii=False, indent=2)
+        atomic_write_json(run_path, payload)
 
     def _archive_run(self) -> None:
         """Archive current state into the versioned run directory."""
         os.makedirs(self._run_dir, exist_ok=True)
         archive_path = os.path.join(self._run_dir, "state.json")
-        with open(archive_path, "w", encoding="utf-8") as fh:
-            json.dump(self.state, fh, ensure_ascii=False, indent=2)
+        atomic_write_json(archive_path, self.state)
 
     def _jira_folder_name(self) -> Optional[str]:
         """Return `<jira_id>-<title-slug>` for the current task, or just `<jira_id>` if no title.
@@ -1597,12 +1594,19 @@ class Forge:
         task_str = self.state.get("task") or ""
         mr_project, mr_iid = self._parse_mr_url()
         workspace_first = self._resolve_run_cwd() or "."
+        # Values come from Discord input (task, MR URL) — shell-quote them so they
+        # can never break out of the hook command. shlex.quote() leaves already-safe
+        # strings (paths, group/repo, digits) unchanged; empty values stay empty so
+        # hooks that tolerate a missing MR URL keep their current behaviour.
+        def _q(value: str) -> str:
+            return shlex.quote(value) if value else ""
+
         cmd = (
             template
-            .replace("{mr_project}", mr_project)
-            .replace("{mr_iid}", mr_iid)
-            .replace("{task}", task_str)
-            .replace("{workspace_first}", workspace_first)
+            .replace("{mr_project}", _q(mr_project))
+            .replace("{mr_iid}", _q(mr_iid))
+            .replace("{task}", _q(task_str))
+            .replace("{workspace_first}", _q(workspace_first))
         )
 
         logger.info("Forge %s: %s for /%s (timeout=%ds): %s", self.name, hook_name, skill_name, timeout_s, cmd[:100])

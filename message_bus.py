@@ -12,6 +12,24 @@ logger = logging.getLogger("mycel.bus")
 Callback = Callable[["Message"], Coroutine[Any, Any, None]]
 
 
+def atomic_write_json(path: str, data: Any, indent: int = 2) -> None:
+    """Write JSON to *path* atomically (tmp file + os.replace).
+
+    A crash mid-write leaves the previous file intact instead of a truncated one.
+    """
+    tmp_path = f"{path}.tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=indent)
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 class Message:
     """A single message on the bus."""
 

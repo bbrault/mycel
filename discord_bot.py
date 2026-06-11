@@ -49,6 +49,62 @@ def chunk_message(text: str) -> list[str]:
 Sendable = Union[discord.TextChannel, discord.Thread]
 
 
+def check_permission(
+    config: Dict[str, Any],
+    user: Union[discord.Member, discord.User, discord.abc.User],
+    forge_name: str,
+) -> bool:
+    """Check if a user may control a forge, based on the `permissions:` config.
+
+    Works for both prefix commands (Member) and interactions (Member or User —
+    a plain User has no roles, so only the `default` rule applies to them).
+    """
+    permissions = (config or {}).get("permissions", {})
+    if not permissions:
+        return True  # No permissions configured -> allow all
+
+    member_roles = {r.name for r in getattr(user, "roles", [])}
+    matched = False
+    for role_name, allowed in permissions.items():
+        if role_name == "default":
+            continue  # Check default last
+        if role_name not in member_roles:
+            continue
+        matched = True
+        if allowed == "all":
+            return True
+        if isinstance(allowed, list) and forge_name in allowed:
+            return True
+
+    if not matched:
+        default = permissions.get("default", "all")
+        if default == "all":
+            return True
+        if isinstance(default, list) and forge_name in default:
+            return True
+
+    return False
+
+
+async def _ensure_allowed(
+    interaction: discord.Interaction,
+    config: Dict[str, Any],
+    forge_name: str,
+) -> bool:
+    """Permission gate for interactions (buttons, selects, modals, slash).
+
+    Returns True if allowed; otherwise sends an ephemeral denial and returns False.
+    """
+    if check_permission(config, interaction.user, forge_name):
+        return True
+    msg = f"\U0001f6ab You are not allowed to use forge **{forge_name}**."
+    if interaction.response.is_done():
+        await interaction.followup.send(msg, ephemeral=True)
+    else:
+        await interaction.response.send_message(msg, ephemeral=True)
+    return False
+
+
 class MonitorAlertView(discord.ui.View):
     """One button per actionable issue from a Sentry/Aikido monitor alert.
 
@@ -74,6 +130,8 @@ class MonitorAlertView(discord.ui.View):
 
     def _make_callback(self, task: str):
         async def _cb(interaction: discord.Interaction) -> None:
+            if not await _ensure_allowed(interaction, self.orchestrator.config, self.forge_name):
+                return
             await interaction.response.defer(thinking=True)
             try:
                 await self.orchestrator.enqueue_forge(self.forge_name, task)
@@ -104,6 +162,8 @@ class ForgeControlView(discord.ui.View):
 
     @discord.ui.button(label="Resume", style=discord.ButtonStyle.blurple, emoji="▶️")
     async def resume_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[type-arg]
+        if not await _ensure_allowed(interaction, self.orchestrator.config, self.forge_name):
+            return
         await self.orchestrator.resume_forge(self.forge_name)
         await interaction.response.send_message(
             f"▶️ **Forge {self.forge_name}** → workflow resumed",
@@ -112,6 +172,8 @@ class ForgeControlView(discord.ui.View):
 
     @discord.ui.button(label="Retry", style=discord.ButtonStyle.blurple, emoji="\U0001f504")
     async def retry_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[type-arg]
+        if not await _ensure_allowed(interaction, self.orchestrator.config, self.forge_name):
+            return
         await self.orchestrator.retry_forge(self.forge_name)
         await interaction.response.send_message(
             f"\U0001f504 **Forge {self.forge_name}** → current step retried",
@@ -120,6 +182,8 @@ class ForgeControlView(discord.ui.View):
 
     @discord.ui.button(label="Reset", style=discord.ButtonStyle.red, emoji="\U0001f5d1️")
     async def reset_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[type-arg]
+        if not await _ensure_allowed(interaction, self.orchestrator.config, self.forge_name):
+            return
         self.orchestrator.reset_forge(self.forge_name)
         await interaction.response.send_message(
             f"\U0001f5d1️ **Forge {self.forge_name}** → reset",
@@ -127,6 +191,8 @@ class ForgeControlView(discord.ui.View):
         self.stop()
 
     async def _push_callback(self, interaction: discord.Interaction) -> None:
+        if not await _ensure_allowed(interaction, self.orchestrator.config, self.forge_name):
+            return
         await interaction.response.defer(thinking=True)
         forge = self.orchestrator.forges.get(self.forge_name)
         if not forge:
@@ -170,6 +236,8 @@ class ClaapElaborateModal(discord.ui.Modal):
         self.add_item(self.notes)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not await _ensure_allowed(interaction, self.orchestrator.config, self.forge_name):
+            return
         notes = (self.notes.value or "").strip()
         idea_label = f"{self.idea_id} ({self.idea_name})" if self.idea_name else self.idea_id
         instructions_parts = [
@@ -249,6 +317,8 @@ class ClaapDiscoveryView(discord.ui.View):
             self.add_item(select)
 
     async def _on_select(self, interaction: discord.Interaction) -> None:
+        if not await _ensure_allowed(interaction, self.orchestrator.config, self.forge_name):
+            return
         idea_id = (interaction.data or {}).get("values", [None])[0]  # type: ignore[index]
         if not idea_id:
             await interaction.response.send_message("❌ No idea selected", ephemeral=True)
@@ -265,6 +335,8 @@ class ClaapDiscoveryView(discord.ui.View):
 
     @discord.ui.button(label="Resume", style=discord.ButtonStyle.blurple, emoji="▶️", row=1)
     async def resume_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[type-arg]
+        if not await _ensure_allowed(interaction, self.orchestrator.config, self.forge_name):
+            return
         await self.orchestrator.resume_forge(self.forge_name)
         await interaction.response.send_message(
             f"▶️ **Forge {self.forge_name}** → workflow resumed",
@@ -273,6 +345,8 @@ class ClaapDiscoveryView(discord.ui.View):
 
     @discord.ui.button(label="Retry", style=discord.ButtonStyle.blurple, emoji="\U0001f504", row=1)
     async def retry_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[type-arg]
+        if not await _ensure_allowed(interaction, self.orchestrator.config, self.forge_name):
+            return
         await self.orchestrator.retry_forge(self.forge_name)
         await interaction.response.send_message(
             f"\U0001f504 **Forge {self.forge_name}** → current step retried",
@@ -281,6 +355,8 @@ class ClaapDiscoveryView(discord.ui.View):
 
     @discord.ui.button(label="Reset", style=discord.ButtonStyle.red, emoji="\U0001f5d1️", row=1)
     async def reset_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[type-arg]
+        if not await _ensure_allowed(interaction, self.orchestrator.config, self.forge_name):
+            return
         self.orchestrator.reset_forge(self.forge_name)
         await interaction.response.send_message(
             f"\U0001f5d1️ **Forge {self.forge_name}** → reset",
@@ -635,31 +711,7 @@ class MycelBot(commands.Bot):
 
     def _check_permission(self, member: discord.Member, forge_name: str) -> bool:
         """Check if a member has permission to use a forge based on role config."""
-        permissions = self.orchestrator.config.get("permissions", {})
-        if not permissions:
-            return True  # No permissions configured -> allow all
-
-        member_roles = {r.name for r in member.roles}
-        matched = False
-        for role_name, allowed in permissions.items():
-            if role_name == "default":
-                continue  # Check default last
-            if role_name not in member_roles:
-                continue
-            matched = True
-            if allowed == "all":
-                return True
-            if isinstance(allowed, list) and forge_name in allowed:
-                return True
-
-        if not matched:
-            default = permissions.get("default", "all")
-            if default == "all":
-                return True
-            if isinstance(default, list) and forge_name in default:
-                return True
-
-        return False
+        return check_permission(self.orchestrator.config, member, forge_name)
 
     async def _handle_forge_command(
         self,
@@ -842,6 +894,14 @@ class MycelBot(commands.Bot):
         real_mention = self.user is not None and any(u.id == self.user.id for u in message.mentions)
         text_trigger = _CONCIERGE_PREFIX.match(content) is not None
         if (real_mention or text_trigger) and not content.startswith("!"):
+            # The concierge can read every forge's state — only answer users
+            # allowed on at least one forge.
+            if self.orchestrator.forges and not any(
+                check_permission(self.orchestrator.config, message.author, f)
+                for f in self.orchestrator.forges
+            ):
+                await message.channel.send("\U0001f6ab You are not allowed to use the Mycel concierge.")
+                return
             text = content
             if self.user is not None:
                 text = text.replace(f"<@{self.user.id}>", "").replace(f"<@!{self.user.id}>", "")
@@ -875,11 +935,15 @@ class MycelBot(commands.Bot):
             await self.process_commands(message)
             return
 
-        # Free-form message (no !) — inject as feedback
+        # Free-form message (no !) — inject as feedback (only from users
+        # allowed to control the target forge; feedback ends up in agent prompts)
         for forge_name, thread in self._forge_threads.items():
             if message.channel.id == thread.id:
                 forge = self.orchestrator.forges.get(forge_name)
                 if forge and forge.state["status"] in ("running", "paused"):
+                    if not check_permission(self.orchestrator.config, message.author, forge_name):
+                        await message.add_reaction("\U0001f6ab")
+                        break
                     self.orchestrator.inject_feedback(forge_name, message.content)
                     await message.add_reaction("\U0001f4dd")
                 break
@@ -889,6 +953,8 @@ class MycelBot(commands.Bot):
                 for forge in self.orchestrator.forges.values():
                     if forge.state["status"] in ("running", "paused"):
                         if forge.name not in self._forge_threads:
+                            if not check_permission(self.orchestrator.config, message.author, forge.name):
+                                break
                             self.orchestrator.inject_feedback(forge.name, message.content)
                             await message.add_reaction("\U0001f4dd")
                             break
@@ -926,6 +992,8 @@ def _register_slash_commands(bot_instance: MycelBot) -> None:
         if forge_name not in bot_instance.orchestrator.forges:
             await interaction.response.send_message(f"Unknown forge: `{forge_name}`", ephemeral=True)
             return
+        if not await _ensure_allowed(interaction, bot_instance.orchestrator.config, forge_name):
+            return
         thread = await bot_instance._create_forge_thread(forge_name, task)
         await bot_instance.orchestrator.enqueue_forge(forge_name, task)
         forge = bot_instance.orchestrator.forges[forge_name]
@@ -948,6 +1016,8 @@ def _register_slash_commands(bot_instance: MycelBot) -> None:
             return
         if spell_name not in bot_instance.orchestrator.spells_config:
             await interaction.response.send_message(f"Unknown step: `{spell_name}`", ephemeral=True)
+            return
+        if not await _ensure_allowed(interaction, bot_instance.orchestrator.config, forge_name):
             return
         task = instructions or f"Isolated run of /{spell_name}"
         thread = await bot_instance._create_forge_thread(forge_name, f"/{spell_name} — {task[:60]}")

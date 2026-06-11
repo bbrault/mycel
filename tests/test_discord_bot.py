@@ -9,7 +9,41 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from discord_bot import MycelBot, chunk_message
+from discord_bot import MycelBot, check_permission, chunk_message
+
+
+def _user(*role_names: str) -> SimpleNamespace:
+    return SimpleNamespace(roles=[SimpleNamespace(name=r) for r in role_names])
+
+
+class TestCheckPermission:
+    CONFIG = {
+        "permissions": {
+            "lead": "all",
+            "dev-team": ["dev", "bugfix"],
+            "default": ["review"],
+        }
+    }
+
+    def test_no_permissions_configured_allows_all(self) -> None:
+        assert check_permission({}, _user(), "dev") is True
+
+    def test_role_with_all_access(self) -> None:
+        assert check_permission(self.CONFIG, _user("lead"), "sentry") is True
+
+    def test_role_with_forge_list(self) -> None:
+        assert check_permission(self.CONFIG, _user("dev-team"), "dev") is True
+        assert check_permission(self.CONFIG, _user("dev-team"), "sentry") is False
+
+    def test_unmatched_role_falls_back_to_default(self) -> None:
+        assert check_permission(self.CONFIG, _user("guest"), "review") is True
+        assert check_permission(self.CONFIG, _user("guest"), "dev") is False
+
+    def test_user_without_roles_uses_default(self) -> None:
+        # Interactions can carry a plain User (no .roles) — only `default` applies.
+        plain_user = SimpleNamespace()
+        assert check_permission(self.CONFIG, plain_user, "review") is True
+        assert check_permission(self.CONFIG, plain_user, "dev") is False
 
 
 class TestChunkMessage:
@@ -78,6 +112,7 @@ class TestOnMessageRouting:
         bot = SimpleNamespace(
             user=user,
             concierge=concierge,
+            orchestrator=SimpleNamespace(forges={}, config={}),
             _send_to_target=AsyncMock(),
         )
         msg = _fake_message("<@42> what's up with dev?", [user], channel)
@@ -93,7 +128,12 @@ class TestOnMessageRouting:
         user = SimpleNamespace(id=42)
         channel = SimpleNamespace(id=888, typing=lambda: _Typing(), send=AsyncMock())
         concierge = SimpleNamespace(handle_message=AsyncMock(return_value="here you go"))
-        bot = SimpleNamespace(user=user, concierge=concierge, _send_to_target=AsyncMock())
+        bot = SimpleNamespace(
+            user=user,
+            concierge=concierge,
+            orchestrator=SimpleNamespace(forges={}, config={}),
+            _send_to_target=AsyncMock(),
+        )
         msg = _fake_message("@Mycel list the forges", [], channel)  # mentions empty
 
         await MycelBot.on_message(bot, msg)
@@ -108,6 +148,7 @@ class TestOnMessageRouting:
         forge = SimpleNamespace(name="dev", state={"status": "running"})
         orchestrator = SimpleNamespace(
             forges={"dev": forge},
+            config={},
             inject_feedback=MagicMock(),
             task_running=True,
         )

@@ -7,7 +7,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from message_bus import Message, MessageBus
+from message_bus import Message, MessageBus, atomic_write_json
 from runner import ClaudeRunner
 
 logger = logging.getLogger("mycel.aikido")
@@ -102,14 +102,12 @@ class AikidoMonitor:
 
     def _save_seen(self) -> None:
         os.makedirs(self._state_dir, exist_ok=True)
-        with open(self._seen_path, "w", encoding="utf-8") as fh:
-            json.dump(self._seen_ids, fh, ensure_ascii=False, indent=2)
+        atomic_write_json(self._seen_path, self._seen_ids)
 
     def _save_check_result(self, data: Dict[str, Any]) -> None:
         os.makedirs(self._state_dir, exist_ok=True)
         path = os.path.join(self._state_dir, "last_check.json")
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, ensure_ascii=False, indent=2)
+        atomic_write_json(path, data)
 
     # ------------------------------------------------------------------
     # Check logic
