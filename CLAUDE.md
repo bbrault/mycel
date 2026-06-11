@@ -75,6 +75,8 @@ Slash: `/forge`, `/spell` (run a step on a forge), `/mycel` group (`status`, `fo
 
 ## Configuration
 
+Config is schema-validated by Pydantic models (`config_models.py`) at startup **and on every `!mycel reload`**. Structural errors (wrong types, a forge missing `channel`, a spell with neither `prompt` nor `prompt_file`) raise `ConfigValidationError` — startup aborts, and `reload` is rejected with the live config left unchanged. Cross-reference issues (forge → unknown `workspace_group`, group repo absent from `repos:`, ritual step with no matching spell, unknown `on_complete`) are logged as warnings, not fatal.
+
 - `mycel_config.yaml` (legacy: `dispatch_config.yaml`): `forges:` (legacy `circles:`) with `channel`, `ritual` (workflow), `familiar` (agent), `workspace_group`, `on_complete`; `permissions`, `workspace_groups`, `repos`; `auto_resume_max_age_s` (top-level, default 1800 = 30 min) — paused-state recovery window; older state is *not* auto-resumed at startup. Set 0 to disable auto-resume entirely.
 - `spells.yaml` (legacy: `skills.yaml`): `spells:` (legacy `skills:`) — each step: prompt, `runner`, timeout, `required_fields`, `pre_run`, `pre_run_timeout` (default 120s), `post_run`, `post_run_timeout` (default 300s), `git_prepare`, `git_finalize`
 - `.env`: `DISCORD_BOT_TOKEN`, `GEMINI_API_KEY`, `WORKSPACE_*` (e.g. `WORKSPACE_REMEDIATION` for `sentry` / `aikido` forges), `DOCS_PATH`, `ISSUES_DIR`, `REMEDIATION_AUTO_FIX` (`true`/`false`, overrides `auto_fix` on sentry+aikido monitors — `false` posts a "🔧 /fix <id>" button per new issue instead of auto-enqueuing)

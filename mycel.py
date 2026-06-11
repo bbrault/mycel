@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
+from config_models import ConfigValidationError, cross_reference_warnings, validate_structure
 from control_server import ControlServer
 from forge import Forge
 from message_bus import Message, MessageBus
@@ -89,6 +90,9 @@ class Mycel:
 
         self._load_config()
         self._load_spells()
+        # Fail fast on a structurally invalid config; log soft inconsistencies.
+        validate_structure(self.config, self.spells_config)
+        self._log_config_warnings()
         self._build_forges()
         self._check_familiars()
         self._init_sentry_monitor()
@@ -165,6 +169,11 @@ class Mycel:
         self.claude_config = self.config.get("claude", {})
         logger.info("Loaded config from %s (%d forges, %d repos)", self.config_path, len(self._forges_section()), len(self._repo_folders))
 
+    def _log_config_warnings(self) -> None:
+        """Log non-fatal config consistency warnings (unknown references etc.)."""
+        for warning in cross_reference_warnings(self.config, self.spells_config):
+            logger.warning("Config: %s", warning)
+
     def _load_config(self) -> None:
         self._apply_config(self._parse_config_file())
 
@@ -183,12 +192,18 @@ class Mycel:
         try:
             new_config = self._parse_config_file()
             new_spells = self._parse_spells_file()
+            # Validate the parsed temporaries before committing anything.
+            validate_structure(new_config, new_spells)
+        except ConfigValidationError as exc:
+            logger.error("Reload rejected (config left unchanged):\n%s", exc)
+            return f"Reload rejected (config left unchanged):\n{exc}"
         except Exception as exc:
             logger.error("Reload error (config left unchanged): %s", exc)
             return f"Reload error (config left unchanged): {exc}"
 
         self._apply_config(new_config)
         self.spells_config = new_spells
+        self._log_config_warnings()
 
         deferred: List[str] = []
         for forge_name, forge in self.forges.items():

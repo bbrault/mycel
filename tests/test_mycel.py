@@ -76,6 +76,19 @@ class TestReloadConfig:
         assert m.spells_config is good_spells
         assert m.config is good_config
 
+    def test_reload_rejects_structurally_invalid_config(self) -> None:
+        tmp = tempfile.mkdtemp()
+        m = _make_mycel(tmp)
+        good_config = m.config
+
+        # A forge missing the required `channel` field.
+        with open(m.config_path, "w", encoding="utf-8") as fh:
+            fh.write("forges:\n  dev:\n    workspace_group: g\n")
+
+        result = m.reload_config()
+        assert "rejected" in result.lower()
+        assert m.config is good_config  # not committed
+
     def test_spells_deferred_for_running_forge(self) -> None:
         tmp = tempfile.mkdtemp()
         m = _make_mycel(tmp)
