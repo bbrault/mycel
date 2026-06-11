@@ -152,6 +152,33 @@ class TestMessageBus:
         assert result[2]["content"] == "msg-9"
 
     @pytest.mark.asyncio
+    async def test_read_log_async_matches_sync(self) -> None:
+        tmp = tempfile.mkdtemp()
+        forge_dir = os.path.join(tmp, "dev")
+        os.makedirs(forge_dir)
+        with open(os.path.join(forge_dir, "messages.jsonl"), "w") as f:
+            for i in range(5):
+                json.dump({"content": f"m-{i}"}, f)
+                f.write("\n")
+
+        bus = MessageBus(bus_dir=tmp)
+        result = await bus.read_log_async("dev", limit=2)
+        assert [m["content"] for m in result] == ["m-3", "m-4"]
+
+    @pytest.mark.asyncio
+    async def test_persist_runs_through_event_loop(self) -> None:
+        # Messages published while the loop runs still land on disk (persist is
+        # offloaded to a thread, not skipped).
+        tmp = tempfile.mkdtemp()
+        bus = MessageBus(bus_dir=tmp)
+        await bus.start()
+        await bus.publish(Message(source="test", content="hello", forge_name="dev"))
+        await asyncio.sleep(0.2)
+        await bus.stop()
+        logged = bus.read_log("dev")
+        assert logged and logged[-1]["content"] == "hello"
+
+    @pytest.mark.asyncio
     async def test_callback_error_does_not_crash_bus(self) -> None:
         bus = MessageBus(bus_dir=tempfile.mkdtemp())
         ok_received: list[Message] = []

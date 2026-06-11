@@ -12,6 +12,7 @@ Phase 1 only wires read-only tools, so ``permission_mode: auto`` is safe.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -93,7 +94,9 @@ class Concierge:
         if not self.enabled:
             return "The Mycel concierge is currently disabled. Use `!mycel status` instead."
 
-        turns = self._load_transcript(conversation_id)
+        # Transcript I/O off the event loop — the file grows with every turn
+        # and a slow disk read would otherwise stall the whole bot.
+        turns = await asyncio.to_thread(self._load_transcript, conversation_id)
         prompt = self._build_prompt(turns, user_text)
 
         runner = get_runner(
@@ -113,6 +116,6 @@ class Concierge:
             return "Sorry, I couldn't reach Mycel right now. Try `!mycel status`."
 
         reply = result.stdout.strip()
-        self._append_turn(conversation_id, "user", user_text)
-        self._append_turn(conversation_id, "assistant", reply)
+        await asyncio.to_thread(self._append_turn, conversation_id, "user", user_text)
+        await asyncio.to_thread(self._append_turn, conversation_id, "assistant", reply)
         return reply

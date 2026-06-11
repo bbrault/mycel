@@ -901,10 +901,10 @@ class Mycel:
             lines.append("No metrics yet — run a forge first.")
         return "\n".join(lines)
 
-    def get_forge_log(self, forge_name: str, limit: int = 20) -> str:
+    async def get_forge_log(self, forge_name: str, limit: int = 20) -> str:
         if forge_name not in self.forges:
             return f"Unknown forge: {forge_name}"
-        messages = self.bus.read_log(forge_name, limit=limit)
+        messages = await self.bus.read_log_async(forge_name, limit=limit)
         if not messages:
             return f"No messages for forge **{forge_name}**."
         lines = [f"\U0001f4dc **Forge {forge_name}** — last {len(messages)} message(s)\n"]

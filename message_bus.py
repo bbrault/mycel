@@ -106,7 +106,9 @@ class MessageBus:
             except asyncio.TimeoutError:
                 continue
 
-            self._persist_message(message)
+            # Persist off the event loop — appending to the JSONL log shouldn't
+            # block delivery of the message to subscribers on a slow disk.
+            await asyncio.to_thread(self._persist_message, message)
 
             for callback in self._callbacks:
                 try:
@@ -141,3 +143,8 @@ class MessageBus:
                     continue
 
         return messages[-limit:]
+
+    async def read_log_async(self, forge_name: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """Async wrapper over :meth:`read_log` — the JSONL log grows over a run,
+        so read it off the event loop."""
+        return await asyncio.to_thread(self.read_log, forge_name, limit)

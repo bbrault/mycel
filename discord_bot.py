@@ -785,7 +785,7 @@ class MycelBot(commands.Bot):
             limit = 20
             if args.strip().isdigit():
                 limit = int(args.strip())
-            log_text = self.orchestrator.get_forge_log(forge_name, limit=limit)
+            log_text = await self.orchestrator.get_forge_log(forge_name, limit=limit)
             target = self._get_send_target(forge_name)
             if target:
                 await self._send_to_target(log_text, target)
