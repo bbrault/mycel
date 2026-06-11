@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
+import time
+
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from runner import ClaudeRunner, CursorRunner, GeminiRunner, RunnerResult, get_runner
+from runner import ClaudeRunner, CursorRunner, GeminiRunner, RunnerResult, get_runner, kill_proc_group
 
 
 class TestRunnerResult:
@@ -71,3 +75,43 @@ class TestGeminiRunner:
     def test_get_runner_gemini(self) -> None:
         runner = get_runner("gemini")
         assert isinstance(runner, GeminiRunner)
+
+
+class TestKillProcGroup:
+    @pytest.mark.asyncio
+    async def test_none_is_noop(self) -> None:
+        await kill_proc_group(None)  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_already_exited_is_noop(self) -> None:
+        proc = await asyncio.create_subprocess_exec(
+            "true", start_new_session=True,
+        )
+        await proc.wait()
+        assert proc.returncode is not None
+        await kill_proc_group(proc)  # returncode set → no-op
+
+    @pytest.mark.asyncio
+    async def test_kills_running_process(self) -> None:
+        # A process that ignores SIGTERM must still be killed (via SIGKILL).
+        proc = await asyncio.create_subprocess_exec(
+            "python3", "-c",
+            "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)",
+            start_new_session=True,
+        )
+        start = time.monotonic()
+        await kill_proc_group(proc)
+        elapsed = time.monotonic() - start
+        assert proc.returncode is not None  # reaped, not a zombie
+        # SIGTERM ignored → escalates to SIGKILL after the 5s budget, well under 30s.
+        assert elapsed < 15
+
+    @pytest.mark.asyncio
+    async def test_kills_child_processes(self) -> None:
+        # Parent spawns a child then sleeps; killpg must reach the whole group.
+        proc = await asyncio.create_subprocess_exec(
+            "bash", "-c", "sleep 30 & sleep 30",
+            start_new_session=True,
+        )
+        await kill_proc_group(proc)
+        assert proc.returncode is not None

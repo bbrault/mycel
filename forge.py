@@ -11,7 +11,6 @@ import os
 import shutil
 import shlex
 import re
-import signal
 import socket
 import subprocess
 import tempfile
@@ -19,7 +18,7 @@ import time
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple
 
 from message_bus import Message, MessageBus, atomic_write_json
-from runner import StreamCallback, get_runner
+from runner import StreamCallback, get_runner, kill_proc_group
 
 logger = logging.getLogger("mycel.forge")
 
@@ -84,8 +83,10 @@ def resolve_issue_context(jira_id: str, docs_path: str, workspace: Dict[str, str
     for name in sorted_names:
         path = seen[name]
         try:
-            content = open(path, "r", encoding="utf-8").read()
-        except OSError:
+            with open(path, "r", encoding="utf-8") as fh:
+                content = fh.read()
+        except OSError as exc:
+            logger.debug("Could not read issue doc %s: %s", path, exc)
             continue
 
         if total_chars >= MAX_TOTAL:
@@ -341,6 +342,9 @@ class Forge:
         self._extra_instructions: Optional[str] = None
         self._feedback_buffer: List[str] = []
         self._running_task: Optional[asyncio.Task[None]] = None
+        # Strong refs to fire-and-forget tasks (e.g. JIRA notifications) so the
+        # event loop can't garbage-collect them mid-flight.
+        self._background_tasks: set = set()
 
         self._load_state()
 
@@ -1282,8 +1286,8 @@ class Forge:
                     capture_output=True,
                     timeout=20,
                 )
-            except OSError:
-                pass
+            except OSError as exc:
+                logger.debug("Forge %s: git worktree prune failed: %s", self.name, exc)
         self._worktree_registry.clear()
         self.workspace = dict(self._original_workspace)
 
@@ -1473,11 +1477,16 @@ class Forge:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
+                start_new_session=True,  # own process group → kill children too
             )
-            await asyncio.wait_for(
-                proc.communicate(input=prompt.encode("utf-8")),
-                timeout=60,
-            )
+            try:
+                await asyncio.wait_for(
+                    proc.communicate(input=prompt.encode("utf-8")),
+                    timeout=60,
+                )
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                await kill_proc_group(proc)
+                raise
             logger.info("Forge %s: JIRA %s notified for /%s", self.name, jira_id, skill_name)
         except Exception as exc:
             logger.warning("Forge %s: JIRA notification failed: %s", self.name, exc)
@@ -1656,30 +1665,11 @@ class Forge:
 
     @staticmethod
     async def _kill_proc_group(proc: Optional[asyncio.subprocess.Process]) -> None:
-        """Best-effort kill of the subprocess and its children (for `start_new_session=True`)."""
-        if proc is None or proc.returncode is not None:
-            return
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        except (ProcessLookupError, PermissionError, OSError):
-            try:
-                proc.terminate()
-            except ProcessLookupError:
-                return
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=5)
-        except asyncio.TimeoutError:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, OSError):
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=2)
-            except asyncio.TimeoutError:
-                pass
+        """Best-effort kill of the subprocess and its children.
+
+        Thin wrapper over :func:`runner.kill_proc_group` (single source of truth).
+        """
+        await kill_proc_group(proc)
 
     async def _run_skill(self, skill_name: str) -> str:
         skill = self.spells[skill_name]
@@ -1871,8 +1861,8 @@ class Forge:
                 os.makedirs(os.path.dirname(cache_path), exist_ok=True)
                 with open(cache_path, "w", encoding="utf-8") as fh:
                     fh.write(output_text)
-            except OSError:
-                pass
+            except OSError as exc:
+                logger.warning("Forge %s: could not write cache for /%s: %s", self.name, skill_name, exc)
 
         # Post-run bash hook (e.g. run tests after implement)
         post_run_template = skill.get("post_run")
@@ -1898,9 +1888,25 @@ class Forge:
         jira_summary = ""
         if json_data:
             jira_summary = json_data.get("summary", "")
-        asyncio.create_task(self._notify_jira(skill_name, jira_summary))
+        self._spawn_background(self._notify_jira(skill_name, jira_summary))
 
         return output_text
+
+    def _spawn_background(self, coro: "Coroutine[Any, Any, None]") -> None:
+        """Schedule a fire-and-forget coroutine, keeping a strong reference and
+        logging any unexpected failure (so errors aren't silently lost)."""
+        task = asyncio.ensure_future(coro)
+        self._background_tasks.add(task)
+
+        def _done(t: "asyncio.Future[None]") -> None:
+            self._background_tasks.discard(t)
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                logger.warning("Forge %s: background task failed: %s", self.name, exc)
+
+        task.add_done_callback(_done)
 
     # ------------------------------------------------------------------
     # Parallel skill helpers

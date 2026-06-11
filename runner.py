@@ -4,11 +4,46 @@ import asyncio
 import logging
 import os
 import shutil
+import signal
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Union
 
 logger = logging.getLogger("mycel.familiar")
 
 StreamCallback = Callable[[str], Coroutine[Any, Any, None]]
+
+
+async def kill_proc_group(proc: Optional[asyncio.subprocess.Process]) -> None:
+    """Best-effort kill of a subprocess and its children.
+
+    Subprocesses are launched with ``start_new_session=True``, so they own a
+    process group: ``killpg`` reaches grandchildren too. Escalates SIGTERM ->
+    SIGKILL with bounded waits so a process that ignores SIGTERM can never hang
+    the event loop (the old ``proc.kill(); await proc.wait()`` could block
+    forever).
+    """
+    if proc is None or proc.returncode is not None:
+        return
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            return
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=5)
+    except asyncio.TimeoutError:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=2)
+        except asyncio.TimeoutError:
+            logger.error("Subprocess pid=%s did not die after SIGKILL", proc.pid)
 
 
 def _parse_token_usage(stderr: str) -> Dict[str, int]:
@@ -109,14 +144,12 @@ async def _run_streaming(
     try:
         done, pending = await asyncio.wait(reader_tasks, timeout=timeout)
     except asyncio.CancelledError:
-        proc.kill()
-        await proc.wait()
+        await kill_proc_group(proc)
         await _drain_readers()
         raise
 
     if pending:
-        proc.kill()
-        await proc.wait()
+        await kill_proc_group(proc)
         await _drain_readers()
         return None
 
@@ -207,6 +240,7 @@ class ClaudeRunner:
             stderr=asyncio.subprocess.PIPE,
             env=env,
             cwd=cwd,
+            start_new_session=True,  # own process group → kill children too
         )
 
         if on_output is not None:
@@ -222,13 +256,11 @@ class ClaudeRunner:
                 timeout=effective_timeout,
             )
         except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
+            await kill_proc_group(proc)
             logger.warning("Claude runner timeout apres %ds", effective_timeout)
             return RunnerResult(stdout="", stderr=f"Claude runner timed out after {effective_timeout}s", returncode=-1, runner_used=self.name)
         except asyncio.CancelledError:
-            proc.kill()
-            await proc.wait()
+            await kill_proc_group(proc)
             raise
 
         logger.info("Claude runner termine (code=%s)", proc.returncode)
@@ -288,6 +320,7 @@ class GeminiRunner:
             stderr=asyncio.subprocess.PIPE,
             env=env,
             cwd=cwd,
+            start_new_session=True,  # own process group → kill children too
         )
 
         if on_output is not None:
@@ -307,15 +340,13 @@ class GeminiRunner:
                 timeout=effective_timeout,
             )
         except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
+            await kill_proc_group(proc)
             logger.warning("Gemini timeout, fallback sur Claude")
             result = await self._fallback.run(prompt, timeout=timeout, cwd=cwd)
             result.runner_used = "claude (fallback after gemini timeout)"
             return result
         except asyncio.CancelledError:
-            proc.kill()
-            await proc.wait()
+            await kill_proc_group(proc)
             raise
 
         if proc.returncode != 0:
@@ -392,6 +423,7 @@ class CursorRunner:
             stderr=asyncio.subprocess.PIPE,
             env=env,
             cwd=cwd,
+            start_new_session=True,  # own process group → kill children too
         )
 
         if on_output is not None:
@@ -410,15 +442,13 @@ class CursorRunner:
                 timeout=effective_timeout,
             )
         except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
+            await kill_proc_group(proc)
             logger.warning("Cursor timeout, fallback sur Claude")
             result = await self._fallback.run(prompt, timeout=timeout, cwd=cwd)
             result.runner_used = "claude (fallback after cursor timeout)"
             return result
         except asyncio.CancelledError:
-            proc.kill()
-            await proc.wait()
+            await kill_proc_group(proc)
             raise
 
         if proc.returncode != 0:
