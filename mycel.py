@@ -272,6 +272,9 @@ class Mycel:
             gitlab_config=self.config.get("gitlab", {}),
             docker_env_mapping=self.config.get("docker_env_mapping", {}),
             repo_folders=self._repo_folders,
+            provisioner=forge_cfg.get("provisioner"),
+            kanta_stack_config=forge_cfg.get("kanta_stack", {}),
+            kanta_stack_bin=(self.config.get("kanta_stack", {}) or {}).get("bin", ""),
         )
         self.forges[forge_name] = forge
 

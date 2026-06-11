@@ -62,6 +62,16 @@ if _PYDANTIC:
         dynamic_workspace: bool = False
         git_worktree: Optional[bool] = None
         on_complete: Optional[str] = None
+        provisioner: Optional[str] = None
+        kanta_stack: Dict[str, Any] = {}
+
+        @model_validator(mode="after")
+        def _known_provisioner(self) -> "ForgeModel":
+            if self.provisioner and self.provisioner not in ("kanta_stack", "clone"):
+                raise ValueError(
+                    f"unknown provisioner '{self.provisioner}' (expected kanta_stack or clone)"
+                )
+            return self
 
     class MycelConfigModel(_Base):
         repos: Dict[str, str] = {}
@@ -69,6 +79,8 @@ if _PYDANTIC:
         # `forges:` is canonical; `circles:` is the accepted legacy alias.
         forges: Dict[str, ForgeModel] = {}
         circles: Dict[str, ForgeModel] = {}
+        # Path to the kanta-stack CLI for the kanta_stack provisioner.
+        kanta_stack: Dict[str, Any] = {}
 
     class SpellModel(_Base):
         prompt: Optional[str] = None

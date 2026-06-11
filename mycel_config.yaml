@@ -6,6 +6,11 @@ gitlab:
   ssh_base: "git@gitlab.com:kanta-app"
   docker_repo: "kanta-docker"
 
+# kanta-stack: per-task isolated dev stacks (worktrees + DB + containers).
+# Forges with `provisioner: kanta_stack` run `kanta-stack up <task>` to provision.
+kanta_stack:
+  bin: /Users/baptiste.brault/Documents/kanta-app/kanta-docker/bin/kanta-stack
+
 # Mapping: repo key → kanta-docker .env variable name
 docker_env_mapping:
   api: KANTA_LAB_API_V2_PATH
@@ -97,7 +102,9 @@ forges:
     familiar: claude
     channel: dev
     workspace_group: feature
-    dynamic_workspace: true
+    provisioner: kanta_stack
+    kanta_stack:
+      teardown: down        # down | destroy | keep — stop containers, keep code+DB
     ritual:
       - analyze
       - elaborate
@@ -168,8 +175,9 @@ forges:
     familiar: claude
     channel: aikido
     workspace_group: remediation
-    dynamic_workspace: true
-    git_worktree: false
+    provisioner: kanta_stack
+    kanta_stack:
+      teardown: down
     ritual:
       - analyze
       - fix

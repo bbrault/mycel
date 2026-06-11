@@ -17,6 +17,7 @@ import tempfile
 import time
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple
 
+from kanta_stack import KantaStack, slugify_task
 from message_bus import Message, MessageBus, atomic_write_json
 from runner import StreamCallback, get_runner, kill_proc_group
 
@@ -296,6 +297,9 @@ class Forge:
         gitlab_config: Optional[Dict[str, Any]] = None,
         docker_env_mapping: Optional[Dict[str, str]] = None,
         repo_folders: Optional[Dict[str, str]] = None,
+        provisioner: Optional[str] = None,
+        kanta_stack_config: Optional[Dict[str, Any]] = None,
+        kanta_stack_bin: str = "",
     ) -> None:
         self.name = name
         self.description = description
@@ -306,6 +310,14 @@ class Forge:
         self.use_git_worktree: bool = use_git_worktree
         self._worktree_registry: List[Tuple[str, str, str]] = []
         self.dynamic_workspace: bool = dynamic_workspace
+        # Provisioning backend: "kanta_stack" delegates to bin/kanta-stack;
+        # "clone" is the legacy /tmp git-clone path (kept for back-compat);
+        # None means a static workspace from config. `dynamic_workspace: true`
+        # maps to the legacy "clone" provisioner.
+        self.provisioner: Optional[str] = provisioner or ("clone" if dynamic_workspace else None)
+        self._kanta_stack_config: Dict[str, Any] = kanta_stack_config or {}
+        self._kanta_stack_bin: str = kanta_stack_bin
+        self._kanta_stack_slug: Optional[str] = None
         self._gitlab_config: Dict[str, Any] = gitlab_config or {}
         self._docker_env_mapping: Dict[str, str] = docker_env_mapping or {}
         self._repo_folders: Dict[str, str] = repo_folders or {}
@@ -402,6 +414,13 @@ class Forge:
             if dw and os.path.isdir(dw.get("dir", "")):
                 self._dynamic_workspace_dir = dw["dir"]
                 self._dynamic_workspace_port = dw.get("port")
+
+            # Re-attach to a kanta-stack instance provisioned in a prior run.
+            ks = self.state.get("kanta_stack")
+            if ks and ks.get("slug"):
+                self._kanta_stack_slug = ks["slug"]
+                if ks.get("workspace"):
+                    self.workspace = dict(ks["workspace"])
 
     def _save_skill_output(self, skill_name: str, output: str) -> None:
         payload = {"skill": skill_name, "output": output}
@@ -956,6 +975,61 @@ class Forge:
             except OSError:
                 continue
         raise RuntimeError(f"No free port found in range {start}-{end}")
+
+    def _folder_to_repo_key(self, folder: str) -> str:
+        """Map a worktree folder (kanta-api-v2) to the mycel repo key (api).
+
+        Falls back to the folder name when no config key maps to it, so every
+        repo stays reachable in the workspace dict.
+        """
+        for key, mapped_folder in self._repo_folders.items():
+            if mapped_folder == folder:
+                return key
+        return folder
+
+    async def _provision_kanta_stack(self) -> None:
+        """Provision (or re-attach to) a per-task kanta-stack instance.
+
+        Idempotent: returns immediately once the stack is up and the workspace
+        is populated, so it can be called at the start of every step.
+        """
+        if self._kanta_stack_slug and self.workspace:
+            return
+
+        task = self.state.get("task") or ""
+        slug = slugify_task(task, fallback=f"{self.name}-{self.state.get('run_number', 0)}")
+        stack = KantaStack(self._kanta_stack_bin, bus=self.bus, forge_name=self.name)
+
+        cfg = self._kanta_stack_config
+        branch = cfg.get("branch")  # None → kanta-stack defaults to feature/<slug>
+        clone_from = cfg.get("clone_from")
+
+        paths = await stack.up(slug, branch=branch, clone_from=clone_from,
+                               timeout=int(cfg.get("up_timeout", 1800)))
+
+        # Map worktree folders to mycel repo keys so cwd resolution + git ops work.
+        workspace = {self._folder_to_repo_key(folder): path for folder, path in paths.items()}
+        self.workspace = workspace
+        self._kanta_stack_slug = slug
+        self.state["kanta_stack"] = {
+            "slug": slug,
+            "port": stack.port(slug),
+            "workspace": workspace,
+        }
+        self._save_state()
+
+    async def _teardown_kanta_stack(self) -> None:
+        """Apply the configured teardown policy after a completed workflow."""
+        if not self._kanta_stack_slug:
+            return
+        policy = (self._kanta_stack_config.get("teardown") or "down").lower()
+        if policy == "keep":
+            return
+        stack = KantaStack(self._kanta_stack_bin, bus=self.bus, forge_name=self.name)
+        if policy == "destroy":
+            await stack.destroy(self._kanta_stack_slug)
+        else:  # "down" (default)
+            await stack.down(self._kanta_stack_slug)
 
     async def _provision_dynamic_workspace(self) -> None:
         if not self.dynamic_workspace or self._dynamic_workspace_dir:
@@ -1674,6 +1748,11 @@ class Forge:
     async def _run_skill(self, skill_name: str) -> str:
         skill = self.spells[skill_name]
 
+        # Provision the isolated per-task stack before the first step runs.
+        # Idempotent — subsequent steps reuse the already-up instance.
+        if self.provisioner == "kanta_stack":
+            await self._provision_kanta_stack()
+
         await self._ensure_git_worktrees()
 
         # Git preparation (if configured for this skill)
@@ -2046,6 +2125,24 @@ class Forge:
                     forge_name=self.name,
                 ))
         finally:
+            if self.provisioner == "kanta_stack":
+                if self.state.get("status") == "completed":
+                    await self._teardown_kanta_stack()
+                elif self._kanta_stack_slug:
+                    logger.info(
+                        "Forge %s: keeping kanta-stack '%s' (status=%s) — work may be unsaved",
+                        self.name, self._kanta_stack_slug, self.state.get("status"),
+                    )
+                    await self.bus.publish(Message(
+                        source="forge",
+                        content=(
+                            f"⚠️ **Forge {self.name}** — stack `{self._kanta_stack_slug}` kept "
+                            f"(workflow not completed). Inspect it, then "
+                            f"`kanta-stack down {self._kanta_stack_slug}` or `destroy --force` when done."
+                        ),
+                        level="warning",
+                        forge_name=self.name,
+                    ))
             if self.dynamic_workspace:
                 if self.state.get("status") == "completed":
                     await self._cleanup_dynamic_workspace()
