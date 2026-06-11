@@ -106,7 +106,6 @@ forges:
     kanta_stack:
       teardown: down        # down | destroy | keep — stop containers, keep code+DB
     ritual:
-      - analyze
       - elaborate
       - plan
       - arch-review
@@ -179,7 +178,6 @@ forges:
     kanta_stack:
       teardown: down
     ritual:
-      - analyze
       - fix
       - implement
       - tech-review
